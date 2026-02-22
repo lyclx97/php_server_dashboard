@@ -1,0 +1,22 @@
+# PHP
+vendor/
+composer.phar
+.php-cs-fixer.cache
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Project Specific
+*.log
