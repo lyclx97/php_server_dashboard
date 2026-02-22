@@ -1,4 +1,4 @@
-# Server Resource Monitor
+# PHP Server Dashboard
 
 A lightweight, single-file PHP application for real-time Linux server monitoring. This tool provides a comprehensive dashboard to visualize system performance directly in your browser without the need for complex agents or external dependencies.
 
