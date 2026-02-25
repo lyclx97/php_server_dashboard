@@ -22,13 +22,20 @@ if (!isset($_SESSION['authenticated'])) {
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
         <title>Login - Server Monitor</title>
         <style>
-            body { font-family: 'Roboto', sans-serif; background-color: #121212; color: #e0e0e0; display: flex; justify-content: center; align-items: center; height: 100vh; margin: 0; }
-            .login-card { background: #1e1e1e; padding: 30px; border-radius: 8px; box-shadow: 0 4px 15px rgba(0,0,0,0.5); border: 1px solid #333; width: 100%; max-width: 350px; text-align: center; }
-            h2 { color: #4fc3f7; margin-bottom: 20px; }
-            input[type="password"] { width: 100%; padding: 12px; margin-bottom: 20px; border-radius: 4px; border: 1px solid #444; background: #2a2a2a; color: #fff; box-sizing: border-box; }
-            button { width: 100%; padding: 12px; border: none; border-radius: 4px; background: #4fc3f7; color: #000; font-weight: bold; cursor: pointer; transition: background 0.3s; }
+            body { font-family: 'Roboto', sans-serif; background-color: #121212; color: #e0e0e0; display: flex; justify-content: center; align-items: center; min-height: 100vh; margin: 0; padding: 20px; box-sizing: border-box; }
+            .login-card { background: #1e1e1e; padding: 40px 30px; border-radius: 12px; box-shadow: 0 8px 30px rgba(0,0,0,0.6); border: 1px solid #333; width: 100%; max-width: 400px; text-align: center; }
+            h2 { color: #4fc3f7; margin-bottom: 25px; font-weight: 500; letter-spacing: 0.5px; }
+            input[type="password"] { width: 100%; padding: 14px; margin-bottom: 20px; border-radius: 6px; border: 1px solid #444; background: #2a2a2a; color: #fff; box-sizing: border-box; font-size: 16px; outline: none; transition: border-color 0.3s; }
+            input[type="password"]:focus { border-color: #4fc3f7; }
+            button { width: 100%; padding: 14px; border: none; border-radius: 6px; background: #4fc3f7; color: #000; font-weight: bold; cursor: pointer; transition: background 0.3s, transform 0.1s; font-size: 16px; }
             button:hover { background: #29b6f6; }
-            .error { color: #f44336; margin-bottom: 15px; font-size: 14px; }
+            button:active { transform: scale(0.98); }
+            .error { color: #f44336; margin-bottom: 20px; font-size: 14px; background: rgba(244, 67, 54, 0.1); padding: 10px; border-radius: 4px; border: 1px solid rgba(244, 67, 54, 0.2); }
+            
+            @media (max-width: 480px) {
+                .login-card { padding: 30px 20px; }
+                h2 { font-size: 20px; }
+            }
         </style>
     </head>
     <body>
@@ -158,6 +165,9 @@ if (isset($_GET['stream'])) {
     };
     $prev_disk_io = $read_disk_io();
     $prev_time = microtime(true);
+
+    // Release session lock to allow other requests (like page refresh) while streaming
+    session_write_close();
 
     // Initial small wait to get first delta quickly
     usleep(200000);
