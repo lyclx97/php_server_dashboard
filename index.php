@@ -278,16 +278,77 @@ if (isset($_GET['stream'])) {
         }
 
         // --- Processes ---
-        $ps = shell_exec('ps -eo pid,comm,%cpu,%mem --sort=-%cpu | head -n 11 2>/dev/null');
+        // Get list of top processes by CPU (for sorting) and their memory usage
+        $ps = shell_exec('ps -eo pid,comm,%mem --sort=-%mem | head -n 11 2>/dev/null');
         $stats['processes'] = [];
+        $proc_pids = [];
         if ($ps) {
             $lines = explode("\n", trim($ps));
             array_shift($lines);
             foreach ($lines as $line) {
                 $p = preg_split('/\s+/', trim($line));
-                if (count($p) >= 4) $stats['processes'][] = ['pid' => $p[0], 'name' => $p[1], 'cpu' => (float)$p[2], 'mem' => (float)$p[3]];
+                if (count($p) >= 3) {
+                    $pid = $p[0];
+                    $proc_pids[] = $pid;
+                    $stats['processes'][$pid] = ['pid' => $pid, 'name' => $p[1], 'cpu' => 0.0, 'mem' => (float)$p[2]];
+                }
             }
         }
+
+        // Calculate real-time CPU usage from /proc/[pid]/stat
+        $read_proc_cpu = function($pids) {
+            $cpu_stats = [];
+            $clk_tck = (int)shell_exec('getconf CLK_TCK 2>/dev/null') ?: 100;
+            foreach ($pids as $pid) {
+                $stat_file = "/proc/$pid/stat";
+                if (file_exists($stat_file)) {
+                    $stat_content = @file_get_contents($stat_file);
+                    if ($stat_content) {
+                        // Comm can contain spaces and parentheses, so find the last ')'
+                        $last_paren = strrpos($stat_content, ')');
+                        if ($last_paren !== false) {
+                            $fields = explode(' ', substr($stat_content, $last_paren + 2));
+                            if (count($fields) >= 12) {
+                                $utime = (int)$fields[11];
+                                $stime = (int)$fields[12];
+                                $cpu_stats[$pid] = ['utime' => $utime, 'stime' => $stime, 'clk_tck' => $clk_tck];
+                            }
+                        }
+                    }
+                }
+            }
+            return $cpu_stats;
+        };
+
+        // First reading
+        $prev_proc = $read_proc_cpu($proc_pids);
+        $prev_time_proc = microtime(true);
+        usleep(200000); // 200ms delay
+
+        // Second reading
+        $curr_proc = $read_proc_cpu($proc_pids);
+        $curr_time_proc = microtime(true);
+        $proc_interval = $curr_time_proc - $prev_time_proc;
+
+        // Calculate CPU usage delta for each process
+        if ($proc_interval > 0) {
+            foreach ($proc_pids as $pid) {
+                if (isset($curr_proc[$pid]) && isset($prev_proc[$pid])) {
+                    $curr_total = $curr_proc[$pid]['utime'] + $curr_proc[$pid]['stime'];
+                    $prev_total = $prev_proc[$pid]['utime'] + $prev_proc[$pid]['stime'];
+                    $diff_total = $curr_total - $prev_total;
+                    // Convert clock ticks to seconds and calculate percentage
+                    $cpu_usage = ($diff_total / $curr_proc[$pid]['clk_tck']) / $proc_interval * 100;
+                    $stats['processes'][$pid]['cpu'] = round($cpu_usage, 1);
+                }
+            }
+        }
+
+        // Re-sort by real-time CPU usage
+        usort($stats['processes'], function($a, $b) {
+            return $b['cpu'] <=> $a['cpu'];
+        });
+        $stats['processes'] = array_values($stats['processes']);
 
         $uptime = (float)@file_get_contents('/proc/uptime') ?: 0;
 
