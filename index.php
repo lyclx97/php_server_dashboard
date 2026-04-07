@@ -101,6 +101,13 @@ if (isset($_GET['stream'])) {
     if ($os_rel = @file_get_contents('/etc/os-release')) {
         if (preg_match('/PRETTY_NAME="([^"]+)"/', $os_rel, $m)) $distro = $m[1];
     }
+    // --- Memory Speed Detection ---
+    $memory_speed = null;
+    $lshw_out = shell_exec('sudo lshw -short 2>/dev/null');
+    if ($lshw_out) {
+        if (preg_match('/(\d+)\s+MHz/', $lshw_out, $m)) $memory_speed = (int)$m[1];
+    }
+    
     // --- Improved CPU Model Detection ---
     $cpu_model = 'Unknown CPU';
     
@@ -168,6 +175,62 @@ if (isset($_GET['stream'])) {
 
     // Release session lock to allow other requests (like page refresh) while streaming
     session_write_close();
+
+    // --- CPU socket topology: logical CPU id -> physical package id (socket) ---
+    $cpu_to_package = [];
+    foreach (glob('/sys/devices/system/cpu/cpu[0-9]*') ?: [] as $dir) {
+        if (!preg_match('/cpu(\d+)$/', basename($dir), $m)) {
+            continue;
+        }
+        $cpuid = (int)$m[1];
+        $pkgFile = $dir . '/topology/physical_package_id';
+        if (file_exists($pkgFile)) {
+            $cpu_to_package[$cpuid] = (int)trim((string)@file_get_contents($pkgFile));
+        }
+    }
+    if ($cpu_to_package === []) {
+        foreach ($read_cpu() as $name => $_) {
+            if ($name === 'total') {
+                continue;
+            }
+            if (preg_match('/^cpu(\d+)$/', $name, $m)) {
+                $cpu_to_package[(int)$m[1]] = 0;
+            }
+        }
+    }
+    $package_ids = array_values(array_unique(array_values($cpu_to_package)));
+    sort($package_ids, SORT_NUMERIC);
+    if ($package_ids === []) {
+        $package_ids = [0];
+    }
+
+    $read_cpu_package_temps = function () {
+        $temps = [];
+        foreach (glob('/sys/class/hwmon/hwmon*') ?: [] as $hwmon) {
+            foreach (glob($hwmon . '/temp*_label') ?: [] as $lf) {
+                $label = trim((string)@file_get_contents($lf));
+                if ($label === '') {
+                    continue;
+                }
+                if (preg_match('/package id\s*(\d+)/i', $label, $m)) {
+                    $pid = (int)$m[1];
+                    $input = preg_replace('/_label$/', '_input', $lf);
+                    if (file_exists($input)) {
+                        $v = (float)@file_get_contents($input);
+                        if ($v > 0) {
+                            $c = $v / 1000;
+                            if ($c > 10 && $c < 110) {
+                                if (!isset($temps[$pid]) || $c > $temps[$pid]) {
+                                    $temps[$pid] = $c;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        return $temps;
+    };
 
     // Initial small wait to get first delta quickly
     usleep(200000);
@@ -262,6 +325,37 @@ if (isset($_GET['stream'])) {
         
         $stats['load'] = array_slice($load, 0, 3);
         $stats['temp'] = $temp;
+
+        $package_temps = $read_cpu_package_temps();
+        $nCores = count($stats['cpu']['cores']);
+        $cpu_packages = [];
+        foreach ($package_ids as $pkgId) {
+            $cpuIdsForPkg = [];
+            foreach ($cpu_to_package as $cpuId => $p) {
+                if ((int)$p === (int)$pkgId) {
+                    $cpuIdsForPkg[] = (int)$cpuId;
+                }
+            }
+            sort($cpuIdsForPkg, SORT_NUMERIC);
+            $loads = [];
+            $pcores = [];
+            foreach ($cpuIdsForPkg as $cpuId) {
+                if ($cpuId < $nCores && isset($stats['cpu']['cores'][$cpuId])) {
+                    $loads[] = $stats['cpu']['cores'][$cpuId]['load'];
+                    $pcores[] = $stats['cpu']['cores'][$cpuId];
+                }
+            }
+            $pkgUsage = count($loads) > 0 ? array_sum($loads) / count($loads) : 0;
+            $sockTemp = isset($package_temps[$pkgId]) ? $package_temps[$pkgId] : $temp;
+            $cpu_packages[] = [
+                'index' => (int)$pkgId,
+                'usage' => $pkgUsage,
+                'cores' => count($pcores),
+                'temp' => $sockTemp,
+                'model' => $cpu_model,
+                'perCore' => $pcores,
+            ];
+        }
 
         // --- Disk Space ---
         $stats['disk'] = [];
@@ -363,8 +457,47 @@ if (isset($_GET['stream'])) {
         }
 
         // --- GPU Stats ---
+        $gpu_max_freq = 0;
+        $gpus = [];
+
+        // NVIDIA first: one entry per physical GPU (CSV fields may contain commas — use str_getcsv)
+        $nvidia_csv = shell_exec('nvidia-smi --query-gpu=index,name,utilization.gpu,utilization.memory,memory.total,memory.used,temperature.gpu,clocks.current.graphics --format=csv,noheader,nounits 2>/dev/null');
+        if ($nvidia_csv !== null && trim($nvidia_csv) !== '') {
+            foreach (explode("\n", trim($nvidia_csv)) as $line) {
+                if ($line === '') {
+                    continue;
+                }
+                $p = str_getcsv($line);
+                if (count($p) < 8) {
+                    continue;
+                }
+                $mem_total_mib = (float)trim($p[4]);
+                $mem_used_mib = (float)trim($p[5]);
+                $mem_total_bytes = (int)round($mem_total_mib * 1024 * 1024);
+                $mem_used_bytes = (int)round($mem_used_mib * 1024 * 1024);
+                $mem_used_pct = $mem_total_mib > 0 ? (int)round($mem_used_mib / $mem_total_mib * 100) : 0;
+                $temp_raw = trim($p[6]);
+                $freq_raw = trim($p[7]);
+                $temp = preg_match('/^[\d.]+$/', $temp_raw) ? (float)$temp_raw : 0;
+                $freq = preg_match('/^[\d.]+$/', $freq_raw) ? (int)$freq_raw : 0;
+                $gpus[] = [
+                    'index' => (int)trim($p[0]),
+                    'name' => trim($p[1]),
+                    'vendor' => 'nvidia',
+                    'available' => true,
+                    'usage' => (float)trim($p[2]),
+                    'memory_utilization' => (float)trim($p[3]),
+                    'memory_used_pct' => $mem_used_pct,
+                    'memory' => ['used' => $mem_used_bytes, 'total' => $mem_total_bytes],
+                    'temp' => $temp,
+                    'freq' => $freq,
+                ];
+            }
+        }
+
         $gpu = ['available' => false, 'usage' => 0, 'memory' => ['used' => 0, 'total' => 0], 'temp' => 0, 'freq' => 0, 'hasDevice' => false, 'name' => 'GPU'];
-        
+
+        if (empty($gpus)) {
         // Method 0: Get actual GPU Model Name via lspci
         $gpu_model_name = '';
         $lspci_out = shell_exec('lspci -mm 2>/dev/null');
@@ -385,9 +518,11 @@ if (isset($_GET['stream'])) {
         $gpu['name'] = 'GPU: ' . $gpu_model_name;
 
         // Check for Intel i915 GPU via multiple methods
-        // Method 1: DRM card device
+        // Method 1: DRM card device (prefer card1 for Intel GPUs on some systems)
         $drm_card = null;
-        if (file_exists('/sys/class/drm/card0')) {
+        if (file_exists('/sys/class/drm/card1')) {
+            $drm_card = '/sys/class/drm/card1'; // Intel GPU often on card1
+        } elseif (file_exists('/sys/class/drm/card0')) {
             $drm_card = '/sys/class/drm/card0';
         } else {
             $cards = glob('/sys/class/drm/card*');
@@ -404,24 +539,62 @@ if (isset($_GET['stream'])) {
         
         if ($drm_card) {
             $gpu['hasDevice'] = true;
+            $gpu['available'] = true;
             
-            // Try frequency paths (usage fallback)
-            $gpu_freq_paths = [$drm_card . '/gt_cur_freq_mhz', $drm_card . '/gt_act_freq_mhz', $drm_card . '/gt_cur_freq'];
-            foreach ($gpu_freq_paths as $p) {
-                if (file_exists($p)) {
-                    $gpu['available'] = true;
-                    $gpu['freq'] = (int)@file_get_contents($p);
-                    break;
+            // Read current and max frequency
+            $gpu_freq = @file_get_contents($drm_card . '/gt_cur_freq_mhz');
+            $gpu_max_freq = @file_get_contents($drm_card . '/gt_max_freq_mhz');
+            
+            if ($gpu_freq !== false && is_numeric(trim($gpu_freq))) {
+                $gpu['freq'] = (int)trim($gpu_freq);
+            } else {
+                $gpu['freq'] = 0;
+            }
+            
+            if ($gpu_max_freq !== false && is_numeric(trim($gpu_max_freq))) {
+                $gpu_max_freq = (int)trim($gpu_max_freq);
+            } else {
+                $gpu_max_freq = 1100; // Default max for i5-8250U
+            }
+            
+            // Try to read engine busy times for real GPU usage
+            $engine_busy_total = 0;
+            $engine_count = 0;
+            $engine_dirs = @glob($drm_card . '/engine/*');
+            
+            if ($engine_dirs && is_array($engine_dirs)) {
+                foreach ($engine_dirs as $eng_dir) {
+                    $busy_file = $eng_dir . '/busy';
+                    if (file_exists($busy_file)) {
+                        $busy = @file_get_contents($busy_file);
+                        if ($busy !== false && is_numeric(trim($busy))) {
+                            $engine_busy_total += (int)trim($busy);
+                            $engine_count++;
+                        }
+                    }
                 }
             }
             
-            // For Intel, usage is better from intel_gpu_top, frequency percentage is a poor fallback
-            $gpu_max_freq = 1000;
-            $gpu_max_paths = [$drm_card . '/gt_max_freq_mhz', $drm_card . '/gt_max_freq'];
-            foreach ($gpu_max_paths as $p) {
-                if (file_exists($p)) { $gpu_max_freq = (int)@file_get_contents($p); break; }
+            // Calculate usage from engine busy times if available
+            if ($engine_count > 0) {
+                $uptime_str = @file_get_contents('/proc/uptime');
+                if ($uptime_str !== false) {
+                    $uptime_secs = (float)trim($uptime_str);
+                    $uptime_ns = $uptime_secs * 1000000000;
+                    
+                    if ($uptime_ns > 0) {
+                        $gpu['usage'] = min(100, max(0, ($engine_busy_total / $engine_count) / $uptime_ns * 100));
+                    } else {
+                        $gpu['usage'] = 0;
+                    }
+                } else {
+                    $gpu['usage'] = 0;
+                }
+            } else {
+                // No busy files - show frequency only
+                $gpu['usage'] = 0;
+                $gpu['freq_info'] = $gpu['freq'] . '/' . $gpu_max_freq . ' MHz';
             }
-            if ($gpu['freq'] > 0) $gpu['usage'] = ($gpu['freq'] / $gpu_max_freq) * 100;
 
             // GPU memory for Intel (shared) - used is gem objects, total is system shared
             if (file_exists('/sys/kernel/debug/dri/0/i915_gem_objects')) {
@@ -465,53 +638,61 @@ if (isset($_GET['stream'])) {
                 if ($data[0]['GPU']['temperature'] > 0) $gpu['temp'] = $data[0]['GPU']['temperature'];
             }
         }
-        
-        // Method 7: NVIDIA GPU fallback
-        if (!$gpu['available'] && file_exists('/usr/bin/nvidia-smi')) {
-            $xpu = shell_exec('/usr/bin/xpu-smi stats --json 2>/dev/null');
-            if ($xpu) {
-                $data = json_decode($xpu, true);
-                if ($data && isset($data[0]['GPU'])) {
-                    $gpu['hasDevice'] = true;
-                    $gpu['available'] = true;
-                    $gpu['name'] = 'INTEL XPU';
-                    $gpu['usage'] = (float)($data[0]['GPU']['utilization'] ?? 0);
-                    $gpu['memory']['used'] = (int)(($data[0]['GPU']['vram_used'] ?? 0) * 1024 * 1024);
-                    $gpu['memory']['total'] = (int)(($data[0]['GPU']['vram_total'] ?? 0) * 1024 * 1024);
-                    $gpu['temp'] = (float)($data[0]['GPU']['temperature'] ?? 0);
-                    $gpu['freq'] = (int)($data[0]['GPU']['frequency'] ?? 0);
-                }
-            }
+
+        $mem = $gpu['memory'];
+        $mem_pct = ($mem['total'] ?? 0) > 0 ? (int)round(($mem['used'] ?? 0) / $mem['total'] * 100) : 0;
+        if ($gpu['hasDevice']) {
+            $gpus[] = [
+                'index' => 0,
+                'name' => $gpu['name'],
+                'vendor' => 'other',
+                'available' => $gpu['available'],
+                'usage' => $gpu['usage'],
+                'memory_used_pct' => $mem_pct,
+                'memory' => $gpu['memory'],
+                'temp' => $gpu['temp'],
+                'freq' => $gpu['freq'],
+                'freq_info' => $gpu['freq_info'] ?? null,
+            ];
         }
-        
-        // Method 6: NVIDIA GPU fallback
-        if (!$gpu['hasDevice'] && file_exists('/usr/bin/nvidia-smi')) {
-            $nvidia = shell_exec('/usr/bin/nvidia-smi --query-gpu=utilization.gpu,memory.total,memory.used,temperature.gpu --format=csv,noheader,nounits 2>/dev/null');
-            if ($nvidia) {
-                $parts = array_map('trim', explode(',', $nvidia));
-                if (count($parts) >= 4) {
-                    $gpu['hasDevice'] = true;
-                    $gpu['available'] = true;
-                    $gpu['name'] = 'NVIDIA';
-                    $gpu['usage'] = (int)$parts[0];
-                    $gpu['memory']['total'] = (int)$parts[1] * 1024 * 1024;
-                    $gpu['memory']['used'] = (int)$parts[2] * 1024 * 1024;
-                    $gpu['temp'] = (int)$parts[3];
-                    $gpu['freq'] = 0;
-                }
-            }
+        }
+
+        $gpu_first = $gpus[0] ?? null;
+        $gpu_payload = array_merge(
+            [
+                'hasDevice' => false,
+                'available' => false,
+                'name' => 'GPU: Unknown GPU',
+                'usage' => 0,
+                'memory' => ['used' => 0, 'total' => 0],
+                'memory_used_pct' => 0,
+                'temp' => 0,
+                'freq' => 0,
+            ],
+            $gpu_first ?: [],
+            ['gpus' => $gpus, 'max_freq' => $gpu_max_freq]
+        );
+        if (!empty($gpus)) {
+            $gpu_payload['hasDevice'] = true;
         }
 
         echo "data: " . json_encode([
             'timestamp' => date('c'),
-            'cpu' => ['usage' => $stats['cpu']['usage'], 'cores' => count($stats['cpu']['cores']), 'model' => $cpu_model, 'perCore' => $stats['cpu']['cores'], 'temp' => $stats['temp']],
-            'memory' => $stats['memory'],
+            'cpu' => [
+                'usage' => $stats['cpu']['usage'],
+                'cores' => count($stats['cpu']['cores']),
+                'model' => $cpu_model,
+                'perCore' => $stats['cpu']['cores'],
+                'temp' => $stats['temp'],
+                'packages' => $cpu_packages,
+            ],
+            'memory' => array_merge($stats['memory'], ['speed' => $memory_speed]),
             'disk' => $stats['disk'],
             'disk_io' => $stats['disk_io'],
             'network' => $stats['network'],
             'networkHistory' => ['download' => array_sum(array_column($stats['network'], 'rx_speed')), 'upload' => array_sum(array_column($stats['network'], 'tx_speed'))],
             'processes' => $stats['processes'],
-            'gpu' => $gpu,
+            'gpu' => $gpu_payload,
             'system' => [
                 'os' => ['distro' => $distro, 'release' => $kernel, 'arch' => $arch],
                 'uptime' => $uptime,
@@ -580,6 +761,11 @@ if (isset($_GET['stream'])) {
         
         /* Standard Stats Grid */
         .card-stats-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-bottom: 10px; min-height: 75px; align-content: start; }
+        
+        /* Memory Card - 3 column layout for Used/Total/Speed */
+        .memory .card-stats-grid { grid-template-columns: 1fr 1fr 1fr; }
+        .memory .stat-full { grid-column: span 3; }
+        
         .stat-box { background: #252525; padding: 6px 8px; border-radius: 4px; border: 1px solid #333; display: flex; flex-direction: column; justify-content: center; }
         .stat-label { font-size: 10px; color: #888; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 2px; }
         .stat-value { font-size: 12px; color: #eee; font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
@@ -591,6 +777,19 @@ if (isset($_GET['stream'])) {
         .swap-bar { background: #00bcd4 !important; }
         .disk .progress-bar { background: #9c27b0; }
         .gpu .progress-bar { background: #00e676; }
+        .gpu .progress-bar.gpu-load-bar { background: #00e676; }
+        .gpu .progress-bar.gpu-vram-bar { background: #69f0ae; }
+        .gpu .gpu-meters-row { display: flex; gap: 12px; align-items: stretch; margin: 8px 0; }
+        .gpu .gpu-meter { flex: 1; min-width: 0; }
+        .gpu .progress-label-row { display: flex; justify-content: space-between; align-items: center; font-size: 12px; margin-bottom: 4px; color: #aaa; }
+        .gpu .progress-label-row span:last-child { font-weight: 600; color: #e0e0e0; }
+        #cpu-cards-container { display: contents; }
+        #gpu-cards-container { display: none; }
+        #gpu-cards-container.gpu-cards-visible { display: contents; }
+        .gpu .gpu-charts-row { display: flex; gap: 10px; align-items: stretch; }
+        .gpu .gpu-chart-wrap { flex: 1; min-width: 0; }
+        .gpu .gpu-chart-caption { font-size: 10px; color: #888; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 2px; }
+        .gpu .gpu-chart-wrap .chart-container { height: 150px; margin-top: 0; position: relative; }
         .chart-container { height: 180px; margin-top: 5px; position: relative; }
         .grid-2col { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
         
@@ -655,29 +854,8 @@ if (isset($_GET['stream'])) {
         </header>
 
         <div class="dashboard-grid">
-            <!-- CPU Card -->
-            <div class="card cpu">
-                <div class="card-header">
-                    <div class="card-title">CPU</div>
-                    <div style="display: flex; align-items: center; gap: 10px;">
-                        <button id="cpu-toggle" class="toggle-btn">Per-Core</button>
-                        <div class="status-indicator" id="cpu-status"></div>
-                    </div>
-                </div>
-                <div class="card-content">
-                    <div class="card-value" id="cpu-usage">0%</div>
-                    <div class="progress-container"><div class="progress-bar" id="cpu-bar" style="width: 0%"></div></div>
-                    <div class="card-stats-grid">
-                        <div class="stat-box"><span class="stat-label">Cores</span><span class="stat-value" id="cpu-cores">0</span></div>
-                        <div class="stat-box"><span class="stat-label">Temp</span><span class="stat-value" id="cpu-temp">0°C</span></div>
-                        <div class="stat-box stat-full"><span class="stat-label">Model</span><span class="stat-value" id="cpu-model">-</span></div>
-                    </div>
-                </div>
-                <div class="card-chart-area">
-                    <div id="cpu-chart-container" class="chart-container"><canvas id="cpu-chart"></canvas></div>
-                    <div id="cpu-percore-container" class="cpu-percore-container" style="display: none;"></div>
-                </div>
-            </div>
+            <!-- CPU cards (one per physical socket; populated by JS) -->
+            <div id="cpu-cards-container"></div>
 
             <!-- Memory Card -->
             <div class="card memory">
@@ -691,9 +869,15 @@ if (isset($_GET['stream'])) {
                     <div class="card-stats-grid">
                         <div class="stat-box"><span class="stat-label">Used</span><span class="stat-value" id="memory-used">0 GB</span></div>
                         <div class="stat-box"><span class="stat-label">Total</span><span class="stat-value" id="memory-total">0 GB</span></div>
+                        <div class="stat-box"><span class="stat-label">Speed</span><span class="stat-value" id="memory-speed">-- MHz</span></div>
                         <div class="stat-box stat-full">
-                            <span class="stat-label">Swap: <span id="swap-usage">0%</span></span>
-                            <div class="swap-mini-bar"><div class="progress-bar swap-bar" id="swap-bar" style="width: 0%"></div></div>
+                            <span class="stat-label">Swap</span>
+                            <div style="display: flex; align-items: center; gap: 8px; margin-top: 4px;">
+                                <div style="flex: 1; height: 4px; background: #333; border-radius: 2px; overflow: hidden;">
+                                    <div class="progress-bar swap-bar" id="swap-bar" style="width: 0%; height: 100%;"></div>
+                                </div>
+                                <span style="font-size: 9px; color: #777; min-width: 60px; text-align: right;" id="swap-usage">0%</span>
+                            </div>
                             <span style="font-size: 9px; color: #777; margin-top: 2px;" id="swap-used-total">0 GB / 0 GB</span>
                         </div>
                     </div>
@@ -747,23 +931,8 @@ if (isset($_GET['stream'])) {
                 <div class="card-chart-area"><div class="chart-container"><canvas id="network-chart"></canvas></div></div>
             </div>
 
-            <!-- GPU Card -->
-            <div class="card gpu" id="gpu-card" style="display: none;">
-                <div class="card-header">
-                    <div class="card-title"><span id="gpu-title">GPU</span></div>
-                    <div class="status-indicator" id="gpu-status"></div>
-                </div>
-                <div class="card-content">
-                    <div class="card-value" id="gpu-usage">0%</div>
-                    <div class="progress-container"><div class="progress-bar" id="gpu-bar" style="width: 0%"></div></div>
-                    <div class="card-stats-grid">
-                        <div class="stat-box"><span class="stat-label">Frequency</span><span class="stat-value" id="gpu-freq">0 MHz</span></div>
-                        <div class="stat-box"><span class="stat-label">Temp</span><span class="stat-value" id="gpu-temp">--°C</span></div>
-                        <div class="stat-box stat-full"><span class="stat-label">VRAM Used</span><span class="stat-value" id="gpu-vram">0 MB</span></div>
-                    </div>
-                </div>
-                <div class="card-chart-area"><div class="chart-container"><canvas id="gpu-chart"></canvas></div></div>
-            </div>
+            <!-- GPU cards (one per device; populated by JS) -->
+            <div id="gpu-cards-container"></div>
         </div>
 
         <div class="grid-2col">
@@ -841,12 +1010,154 @@ if (isset($_GET['stream'])) {
             }
         });
 
-        const cpuChart = createChart('cpu-chart', '#ff9800', 'CPU');
         const memoryChart = createChart('memory-chart', '#2196f3', 'RAM', 16 * 1024**3, true);
         const diskChart = createChart('disk-chart', '#9c27b0', 'Disk');
         const networkChart = createChart('network-chart', '#4caf50', 'Net', 1024*1024, true);
         networkChart.data.datasets.push({ label: 'Up', data: Array(30).fill(0), borderColor: '#2196f3', backgroundColor: '#2196f31A', tension: 0.4, borderWidth: 2, pointRadius: 0 });
-        const gpuChart = createChart('gpu-chart', '#00e676', 'GPU');
+        const gpuCharts = new Map();
+        const destroyGpuCharts = () => {
+            gpuCharts.forEach((pair) => {
+                try { if (pair.gpu) pair.gpu.destroy(); } catch (e) {}
+                try { if (pair.vram) pair.vram.destroy(); } catch (e) {}
+            });
+            gpuCharts.clear();
+        };
+        const buildGpuCardHtml = (i) => `
+            <div class="card gpu" id="gpu-card-${i}">
+                <div class="card-header">
+                    <div class="card-title"><span class="gpu-card-title" id="gpu-title-${i}">GPU</span></div>
+                    <div class="status-indicator" id="gpu-status-${i}"></div>
+                </div>
+                <div class="card-content">
+                    <div class="gpu-meters-row">
+                        <div class="gpu-meter">
+                            <div class="progress-label-row"><span>GPU</span><span id="gpu-load-pct-${i}">0%</span></div>
+                            <div class="progress-container"><div class="progress-bar gpu-load-bar" id="gpu-load-bar-${i}" style="width:0%"></div></div>
+                        </div>
+                        <div class="gpu-meter">
+                            <div class="progress-label-row"><span>VRAM</span><span id="gpu-vram-pct-${i}">0%</span></div>
+                            <div class="progress-container"><div class="progress-bar gpu-vram-bar" id="gpu-vram-bar-${i}" style="width:0%"></div></div>
+                        </div>
+                    </div>
+                    <div class="card-stats-grid" id="gpu-stats-grid-${i}"></div>
+                </div>
+                <div class="card-chart-area">
+                    <div class="gpu-charts-row">
+                        <div class="gpu-chart-wrap">
+                            <div class="gpu-chart-caption">GPU load</div>
+                            <div class="chart-container"><canvas id="gpu-chart-${i}"></canvas></div>
+                        </div>
+                        <div class="gpu-chart-wrap">
+                            <div class="gpu-chart-caption">VRAM</div>
+                            <div class="chart-container"><canvas id="gpu-vram-chart-${i}"></canvas></div>
+                        </div>
+                    </div>
+                </div>
+            </div>`;
+
+        const updateGpuSection = (gpuPayload) => {
+            const container = document.getElementById('gpu-cards-container');
+            const gpus = (gpuPayload && gpuPayload.gpus) ? gpuPayload.gpus : [];
+            const visible = gpus.length > 0 && gpus[0].name && !String(gpus[0].name).includes('Unknown GPU');
+            if (!visible) {
+                container.classList.remove('gpu-cards-visible');
+                container.innerHTML = '';
+                destroyGpuCharts();
+                return;
+            }
+            container.classList.add('gpu-cards-visible');
+            if (container.children.length !== gpus.length) {
+                container.innerHTML = '';
+                destroyGpuCharts();
+                const gpuLineOpts = (color, label) => ({
+                    type: 'line',
+                    data: { labels: Array(30).fill(''), datasets: [{ label, data: Array(30).fill(0), borderColor: color, backgroundColor: color + '1A', tension: 0.4, borderWidth: 2, pointRadius: 0 }] },
+                    options: {
+                        responsive: true, maintainAspectRatio: false, animation: false,
+                        plugins: { legend: { display: false } },
+                        scales: { x: { display: false }, y: { min: 0, max: 100, ticks: { callback: v => v + '%' } } }
+                    }
+                });
+                gpus.forEach((g, i) => {
+                    container.insertAdjacentHTML('beforeend', buildGpuCardHtml(i));
+                    const ctxGpu = document.getElementById('gpu-chart-' + i).getContext('2d');
+                    const ctxVram = document.getElementById('gpu-vram-chart-' + i).getContext('2d');
+                    gpuCharts.set(i, {
+                        gpu: new Chart(ctxGpu, gpuLineOpts('#00e676', 'GPU')),
+                        vram: new Chart(ctxVram, gpuLineOpts('#69f0ae', 'VRAM'))
+                    });
+                });
+            }
+            gpus.forEach((g, i) => {
+                const grid = document.getElementById('gpu-stats-grid-' + i);
+                const isNv = g.vendor === 'nvidia';
+                if (grid && grid.dataset.built !== (isNv ? 'nv' : 'oth')) {
+                    grid.dataset.built = isNv ? 'nv' : 'oth';
+                    if (isNv) {
+                        grid.innerHTML = `
+                            <div class="stat-box"><span class="stat-label">Temp</span><span class="stat-value" id="gpu-temp-${i}">--°C</span></div>
+                            <div class="stat-box"><span class="stat-label">Clock</span><span class="stat-value" id="gpu-clock-${i}">-- MHz</span></div>
+                            <div class="stat-box"><span class="stat-label">VRAM</span><span class="stat-value" id="gpu-vram-detail-${i}">--</span></div>
+                            <div class="stat-box"><span class="stat-label">VRAM controller</span><span class="stat-value" id="gpu-mem-ctrl-${i}">--%</span></div>`;
+                    } else {
+                        grid.innerHTML = `
+                            <div class="stat-box"><span class="stat-label">Frequency</span><span class="stat-value" id="gpu-freq-${i}">-- MHz</span></div>
+                            <div class="stat-box"><span class="stat-label">Temp</span><span class="stat-value" id="gpu-temp-${i}">--°C</span></div>
+                            <div class="stat-box stat-full"><span class="stat-label">VRAM</span><span class="stat-value" id="gpu-vram-detail-${i}">--</span></div>`;
+                    }
+                }
+                const gpuIdx = (g.index !== undefined && g.index !== null) ? g.index : i;
+                const gpuTitleName = String(g.name || '').replace(/^GPU:\s*/i, '').trim() || 'Unknown';
+                document.getElementById('gpu-title-' + i).textContent = 'GPU' + gpuIdx + ' · ' + gpuTitleName;
+                if (g.available === false) {
+                    document.getElementById('gpu-load-pct-' + i).textContent = 'N/A';
+                    document.getElementById('gpu-load-bar-' + i).style.width = '0%';
+                    document.getElementById('gpu-vram-pct-' + i).textContent = 'N/A';
+                    document.getElementById('gpu-vram-bar-' + i).style.width = '0%';
+                    document.getElementById('gpu-status-' + i).className = 'status-indicator status-warning';
+                    return;
+                }
+                const loadPct = Math.round(g.usage != null ? g.usage : 0);
+                const vramPct = Math.round(g.memory_used_pct != null ? g.memory_used_pct : 0);
+                document.getElementById('gpu-load-pct-' + i).textContent = loadPct + '%';
+                updateTextStatus(document.getElementById('gpu-load-pct-' + i), loadPct);
+                document.getElementById('gpu-load-bar-' + i).style.width = Math.min(100, loadPct) + '%';
+                document.getElementById('gpu-vram-pct-' + i).textContent = vramPct + '%';
+                updateTextStatus(document.getElementById('gpu-vram-pct-' + i), vramPct);
+                document.getElementById('gpu-vram-bar-' + i).style.width = Math.min(100, vramPct) + '%';
+                const vramDetail = (g.memory && g.memory.total > 0)
+                    ? formatBytes(g.memory.used) + ' / ' + formatBytes(g.memory.total)
+                    : '--';
+                const tEl = document.getElementById('gpu-temp-' + i);
+                if (tEl) tEl.textContent = g.temp > 0 ? Math.round(g.temp) + '°C' : '--°C';
+                const vd = document.getElementById('gpu-vram-detail-' + i);
+                if (vd) vd.textContent = vramDetail;
+                if (isNv) {
+                    const clk = document.getElementById('gpu-clock-' + i);
+                    if (clk) clk.textContent = (g.freq > 0) ? (g.freq + ' MHz') : '-- MHz';
+                    const mc = document.getElementById('gpu-mem-ctrl-' + i);
+                    if (mc && g.memory_utilization != null) mc.textContent = Math.round(g.memory_utilization) + '%';
+                } else {
+                    const fq = document.getElementById('gpu-freq-' + i);
+                    if (fq) {
+                        if (g.freq_info) fq.textContent = g.freq_info;
+                        else if (g.freq) fq.textContent = g.freq + ' MHz';
+                        else fq.textContent = '-- MHz';
+                    }
+                }
+                const statusPct = Math.max(loadPct, vramPct);
+                updateStatus('gpu-status-' + i, statusPct);
+                const pair = gpuCharts.get(i);
+                if (pair && pair.gpu && pair.vram) {
+                    pair.gpu.data.datasets[0].data.shift();
+                    pair.gpu.data.datasets[0].data.push(loadPct);
+                    pair.gpu.update('none');
+                    pair.vram.data.datasets[0].data.shift();
+                    pair.vram.data.datasets[0].data.push(vramPct);
+                    pair.vram.update('none');
+                }
+            });
+        };
 
         let selectedIface = 'all';
         document.getElementById('network-interface-select').onchange = e => selectedIface = e.target.value;
@@ -854,33 +1165,155 @@ if (isset($_GET['stream'])) {
         let selectedDisk = 'all';
         document.getElementById('disk-select').onchange = e => selectedDisk = e.target.value;
 
-        let coreCharts = {};
-        const updatePerCore = (cores) => {
-            const container = document.getElementById('cpu-percore-container');
+        const cpuCharts = new Map();
+        const coreChartsBySocket = new Map();
+        const destroyCpuCharts = () => {
+            cpuCharts.forEach((ch) => { try { ch.destroy(); } catch (e) {} });
+            cpuCharts.clear();
+            coreChartsBySocket.forEach((sub) => {
+                Object.values(sub).forEach((ch) => { try { ch.destroy(); } catch (e) {} });
+            });
+            coreChartsBySocket.clear();
+        };
+
+        const buildCpuCardHtml = (i) => `
+            <div class="card cpu" id="cpu-card-${i}">
+                <div class="card-header">
+                    <div class="card-title"><span id="cpu-title-${i}">CPU</span></div>
+                    <div style="display: flex; align-items: center; gap: 10px;">
+                        <button type="button" class="toggle-btn cpu-toggle" data-socket="${i}" id="cpu-toggle-${i}">Per-Core</button>
+                        <div class="status-indicator" id="cpu-status-${i}"></div>
+                    </div>
+                </div>
+                <div class="card-content">
+                    <div class="card-value" id="cpu-usage-${i}">0%</div>
+                    <div class="progress-container"><div class="progress-bar" id="cpu-bar-${i}" style="width: 0%"></div></div>
+                    <div class="card-stats-grid">
+                        <div class="stat-box"><span class="stat-label">Cores</span><span class="stat-value" id="cpu-cores-${i}">0</span></div>
+                        <div class="stat-box"><span class="stat-label">Temp</span><span class="stat-value" id="cpu-temp-${i}">--°C</span></div>
+                        <div class="stat-box stat-full"><span class="stat-label">Model</span><span class="stat-value" id="cpu-model-${i}">-</span></div>
+                    </div>
+                </div>
+                <div class="card-chart-area">
+                    <div id="cpu-chart-container-${i}" class="chart-container"><canvas id="cpu-chart-${i}"></canvas></div>
+                    <div id="cpu-percore-container-${i}" class="cpu-percore-container" style="display: none;"></div>
+                </div>
+            </div>`;
+
+        const updatePerCoreForSocket = (socketIdx, cores) => {
+            const container = document.getElementById('cpu-percore-container-' + socketIdx);
+            if (!container) return;
+            const key = 's' + socketIdx;
+            let sub = coreChartsBySocket.get(key) || {};
             if (container.children.length !== cores.length) {
                 container.innerHTML = '';
-                coreCharts = {};
+                Object.values(sub).forEach((ch) => { try { ch.destroy(); } catch (e) {} });
+                sub = {};
                 cores.forEach((c, i) => {
+                    const cid = 'core-' + socketIdx + '-' + i;
                     const div = document.createElement('div');
                     div.className = 'core-chart-container';
-                    div.innerHTML = `<div class="core-chart-label">Core ${i}: 0%</div><canvas id="core-${i}"></canvas>`;
+                    div.innerHTML = `<div class="core-chart-label">Core ${i}: 0%</div><canvas id="${cid}"></canvas>`;
                     container.appendChild(div);
-                    coreCharts[i] = new Chart(document.getElementById(`core-${i}`).getContext('2d'), {
+                    sub[i] = new Chart(document.getElementById(cid).getContext('2d'), {
                         type: 'line',
                         data: { labels: Array(20).fill(''), datasets: [{ data: Array(20).fill(0), borderColor: '#ff9800', borderWidth: 1, pointRadius: 0, fill: true, backgroundColor: '#ff98001A' }] },
                         options: { responsive: true, maintainAspectRatio: false, animation: false, plugins: { legend: false }, scales: { x: { display: false }, y: { min: 0, max: 100, display: false } } }
                     });
                 });
+                coreChartsBySocket.set(key, sub);
             }
+            sub = coreChartsBySocket.get(key);
             cores.forEach((c, i) => {
                 const val = Math.round(c.load);
-                const chart = coreCharts[i];
+                const chart = sub[i];
+                if (!chart) return;
                 chart.data.datasets[0].data.shift();
                 chart.data.datasets[0].data.push(val);
                 chart.update('none');
-                container.querySelector(`#core-${i}`).previousSibling.textContent = `Core ${i}: ${val}%`;
+                const canvas = document.getElementById('core-' + socketIdx + '-' + i);
+                if (canvas && canvas.previousSibling) canvas.previousSibling.textContent = `Core ${i}: ${val}%`;
             });
         };
+
+        const updateCpuSection = (cpuPayload) => {
+            const container = document.getElementById('cpu-cards-container');
+            let pkgs = (cpuPayload && cpuPayload.packages && cpuPayload.packages.length) ? cpuPayload.packages : [];
+            if (pkgs.length === 0 && cpuPayload) {
+                pkgs = [{
+                    index: 0,
+                    usage: cpuPayload.usage,
+                    cores: cpuPayload.cores,
+                    temp: cpuPayload.temp,
+                    model: cpuPayload.model,
+                    perCore: cpuPayload.perCore || []
+                }];
+            }
+            if (pkgs.length === 0) {
+                container.innerHTML = '';
+                destroyCpuCharts();
+                return;
+            }
+            if (container.children.length !== pkgs.length) {
+                container.innerHTML = '';
+                destroyCpuCharts();
+                pkgs.forEach((p, i) => {
+                    container.insertAdjacentHTML('beforeend', buildCpuCardHtml(i));
+                    const ctx = document.getElementById('cpu-chart-' + i).getContext('2d');
+                    cpuCharts.set(i, new Chart(ctx, {
+                        type: 'line',
+                        data: { labels: Array(30).fill(''), datasets: [{ label: 'CPU', data: Array(30).fill(0), borderColor: '#ff9800', backgroundColor: '#ff98001A', tension: 0.4, borderWidth: 2, pointRadius: 0 }] },
+                        options: {
+                            responsive: true, maintainAspectRatio: false, animation: false,
+                            plugins: { legend: { display: false } },
+                            scales: { x: { display: false }, y: { min: 0, max: 100, ticks: { callback: v => v + '%' } } }
+                        }
+                    }));
+                });
+            }
+            pkgs.forEach((p, i) => {
+                const pkgIdx = (p.index !== undefined && p.index !== null) ? p.index : i;
+                const titleModel = String(p.model || cpuPayload.model || '').trim() || 'Unknown';
+                document.getElementById('cpu-title-' + i).textContent = 'CPU' + pkgIdx;
+                const cpuVal = Math.round(p.usage != null ? p.usage : 0);
+                const cpuUsageEl = document.getElementById('cpu-usage-' + i);
+                cpuUsageEl.textContent = cpuVal + '%';
+                updateTextStatus(cpuUsageEl, cpuVal);
+                document.getElementById('cpu-bar-' + i).style.width = cpuVal + '%';
+                document.getElementById('cpu-cores-' + i).textContent = p.cores != null ? p.cores : 0;
+                document.getElementById('cpu-model-' + i).textContent = titleModel;
+                const t = p.temp;
+                const tempEl = document.getElementById('cpu-temp-' + i);
+                if (t > 0) {
+                    tempEl.textContent = Math.round(t) + '°C';
+                    tempEl.style.color = t > 75 ? '#f44336' : (t > 60 ? '#ff9800' : '#4caf50');
+                } else {
+                    tempEl.textContent = '--°C';
+                    tempEl.style.color = '';
+                }
+                updateStatus('cpu-status-' + i, cpuVal);
+                const ch = cpuCharts.get(i);
+                if (ch) {
+                    ch.data.datasets[0].data.shift();
+                    ch.data.datasets[0].data.push(cpuVal);
+                    ch.update('none');
+                }
+                updatePerCoreForSocket(i, p.perCore || []);
+            });
+        };
+
+        document.getElementById('cpu-cards-container').addEventListener('click', (e) => {
+            const btn = e.target.closest('.cpu-toggle');
+            if (!btn) return;
+            const i = btn.dataset.socket;
+            const chartCont = document.getElementById('cpu-chart-container-' + i);
+            const perCont = document.getElementById('cpu-percore-container-' + i);
+            if (!chartCont || !perCont) return;
+            const isPC = perCont.style.display === 'none';
+            perCont.style.display = isPC ? 'grid' : 'none';
+            chartCont.style.display = isPC ? 'none' : 'block';
+            btn.classList.toggle('active', isPC);
+        });
 
         const statusEl = document.getElementById('connection-status');
         const evtSource = new EventSource("?stream=1");
@@ -910,26 +1343,8 @@ if (isset($_GET['stream'])) {
             const d = JSON.parse(e.data);
             document.getElementById('current-time').textContent = new Date(d.timestamp).toLocaleTimeString();
             
-            // CPU
-            const cpuVal = Math.round(d.cpu.usage);
-            const cpuUsageEl = document.getElementById('cpu-usage');
-            cpuUsageEl.textContent = cpuVal + '%';
-            updateTextStatus(cpuUsageEl, cpuVal);
-            document.getElementById('cpu-bar').style.width = cpuVal + '%';
-            document.getElementById('cpu-cores').textContent = d.cpu.cores;
-            document.getElementById('cpu-model').textContent = d.cpu.model;
-            
-            if (d.cpu.temp > 0) {
-                const tempEl = document.getElementById('cpu-temp');
-                tempEl.textContent = Math.round(d.cpu.temp) + '°C';
-                tempEl.style.color = d.cpu.temp > 75 ? '#f44336' : (d.cpu.temp > 60 ? '#ff9800' : '#4caf50');
-            }
-            
-            updateStatus('cpu-status', cpuVal);
-            cpuChart.data.datasets[0].data.shift();
-            cpuChart.data.datasets[0].data.push(cpuVal);
-            cpuChart.update('none');
-            updatePerCore(d.cpu.perCore);
+            // CPU (one card per physical socket)
+            updateCpuSection(d.cpu);
 
             // Memory & Swap
             const memPerc = Math.round(d.memory.percentage);
@@ -939,6 +1354,13 @@ if (isset($_GET['stream'])) {
             document.getElementById('memory-bar').style.width = memPerc + '%';
             document.getElementById('memory-total').textContent = formatBytes(d.memory.total);
             document.getElementById('memory-used').textContent = formatBytes(d.memory.used);
+            
+            // Memory Speed
+            if (d.memory.speed !== null && d.memory.speed !== undefined) {
+                document.getElementById('memory-speed').textContent = d.memory.speed + ' MHz';
+            } else {
+                document.getElementById('memory-speed').textContent = '-- MHz';
+            }
             
             const swapPerc = Math.round(d.memory.swapPercentage);
             document.getElementById('swap-usage').textContent = swapPerc + '%';
@@ -1019,35 +1441,8 @@ if (isset($_GET['stream'])) {
             networkChart.options.scales.y.max = Math.max(1024*1024, maxNet * 1.2);
             networkChart.update('none');
 
-            // GPU
-            if (d.gpu && d.gpu.hasDevice && d.gpu.name && !d.gpu.name.includes('Unknown GPU')) {
-                document.getElementById('gpu-card').style.display = 'flex';
-                const gpuName = d.gpu.name || 'GPU';
-                document.getElementById('gpu-title').textContent = gpuName;
-                if (d.gpu.available) {
-                    const gpuVal = Math.round(d.gpu.usage);
-                    document.getElementById('gpu-usage').textContent = gpuVal + '%';
-                    updateTextStatus(document.getElementById('gpu-usage'), gpuVal);
-                    document.getElementById('gpu-bar').style.width = gpuVal + '%';
-                    document.getElementById('gpu-freq').textContent = d.gpu.freq + ' MHz';
-                    document.getElementById('gpu-temp').textContent = d.gpu.temp > 0 ? Math.round(d.gpu.temp) + '°C' : '--°C';
-                    document.getElementById('gpu-vram').textContent = d.gpu.memory.used > 0 ? formatBytes(d.gpu.memory.used) : '-- MB';
-                    updateStatus('gpu-status', gpuVal);
-                    gpuChart.data.datasets[0].data.shift();
-                    gpuChart.data.datasets[0].data.push(gpuVal);
-                    gpuChart.update('none');
-                } else {
-                    // Device exists but no data (GuC not enabled)
-                    document.getElementById('gpu-usage').textContent = 'N/A';
-                    document.getElementById('gpu-bar').style.width = '0%';
-                    document.getElementById('gpu-freq').textContent = '-- MHz';
-                    document.getElementById('gpu-temp').textContent = '--°C';
-                    document.getElementById('gpu-vram').textContent = '-- MB';
-                    document.getElementById('gpu-status').className = 'status-indicator status-warning';
-                }
-            } else {
-                document.getElementById('gpu-card').style.display = 'none';
-            }
+            // GPU (multi-card: d.gpu.gpus[])
+            updateGpuSection(d.gpu);
 
             // Processes
             document.getElementById('processes-body').innerHTML = d.processes.map(p => `<tr><td>${p.pid}</td><td>${p.name}</td><td class="cpu-cell">${p.cpu}%</td><td class="mem-cell">${p.mem}%</td></tr>`).join('');
@@ -1077,12 +1472,6 @@ if (isset($_GET['stream'])) {
             statusEl.textContent = 'Connection lost. Reconnecting...';
         };
 
-        document.getElementById('cpu-toggle').onclick = function() {
-            const isPC = document.getElementById('cpu-percore-container').style.display === 'none';
-            document.getElementById('cpu-percore-container').style.display = isPC ? 'grid' : 'none';
-            document.getElementById('cpu-chart-container').style.display = isPC ? 'none' : 'block';
-            this.classList.toggle('active', isPC);
-        };
     </script>
 </body>
 </html>
