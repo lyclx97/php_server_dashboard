@@ -5,6 +5,18 @@
  */
 
 // --- Password Protection ---
+// Keep login session valid longer (12h) to avoid frequent re-login after reconnects.
+$sessionLifetime = 43200;
+ini_set('session.gc_maxlifetime', (string)$sessionLifetime);
+$cookieParams = session_get_cookie_params();
+session_set_cookie_params([
+    'lifetime' => $sessionLifetime,
+    'path' => $cookieParams['path'] ?? '/',
+    'domain' => $cookieParams['domain'] ?? '',
+    'secure' => $cookieParams['secure'] ?? false,
+    'httponly' => $cookieParams['httponly'] ?? true,
+    'samesite' => $cookieParams['samesite'] ?? 'Lax',
+]);
 session_start();
 $PROTECTED_PASSWORD = "admin888"; // CHANGE THIS PASSWORD
 
@@ -59,13 +71,29 @@ if (!isset($_SESSION['authenticated'])) {
 error_reporting(E_ALL);
 ini_set('display_errors', 0);
 
+// Hostname for display
+$hostname = php_uname('n') ?: (function_exists('gethostname') ? gethostname() : '');
+
 // --- Backend Logic ---
 
 if (isset($_GET['stream'])) {
+    // Make SSE stream long-lived and reduce server-side timeout disconnects.
+    @set_time_limit(0);
+    @ini_set('max_execution_time', '0');
+    @ini_set('output_buffering', 'off');
+    @ini_set('zlib.output_compression', '0');
+
     header('Content-Type: text/event-stream');
-    header('Cache-Control: no-cache');
+    header('Cache-Control: no-cache, no-transform');
     header('Connection: keep-alive');
     header('X-Accel-Buffering: no'); // Disable buffering for Nginx
+    header('Content-Encoding: none');
+    echo "retry: 3000\n\n";
+    // Try to disable all PHP output buffering layers for low-latency SSE.
+    while (ob_get_level() > 0) {
+        @ob_end_flush();
+    }
+    @ob_implicit_flush(true);
 
     $read_cpu = function() {
         $data = @file_get_contents('/proc/stat');
@@ -232,6 +260,33 @@ if (isset($_GET['stream'])) {
         return $temps;
     };
 
+    // Process CPU sampler (delta against previous loop; avoids per-loop extra sleep)
+    $read_proc_cpu = function($pids) {
+        $cpu_stats = [];
+        $clk_tck = (int)shell_exec('getconf CLK_TCK 2>/dev/null') ?: 100;
+        foreach ($pids as $pid) {
+            $stat_file = "/proc/$pid/stat";
+            if (file_exists($stat_file)) {
+                $stat_content = @file_get_contents($stat_file);
+                if ($stat_content) {
+                    // Comm can contain spaces and parentheses, so find the last ')'
+                    $last_paren = strrpos($stat_content, ')');
+                    if ($last_paren !== false) {
+                        $fields = explode(' ', substr($stat_content, $last_paren + 2));
+                        if (count($fields) >= 12) {
+                            $utime = (int)$fields[11];
+                            $stime = (int)$fields[12];
+                            $cpu_stats[$pid] = ['utime' => $utime, 'stime' => $stime, 'clk_tck' => $clk_tck];
+                        }
+                    }
+                }
+            }
+        }
+        return $cpu_stats;
+    };
+    $prev_proc = [];
+    $prev_time_proc = microtime(true);
+
     // Initial small wait to get first delta quickly
     usleep(200000);
 
@@ -389,43 +444,13 @@ if (isset($_GET['stream'])) {
             }
         }
 
-        // Calculate real-time CPU usage from /proc/[pid]/stat
-        $read_proc_cpu = function($pids) {
-            $cpu_stats = [];
-            $clk_tck = (int)shell_exec('getconf CLK_TCK 2>/dev/null') ?: 100;
-            foreach ($pids as $pid) {
-                $stat_file = "/proc/$pid/stat";
-                if (file_exists($stat_file)) {
-                    $stat_content = @file_get_contents($stat_file);
-                    if ($stat_content) {
-                        // Comm can contain spaces and parentheses, so find the last ')'
-                        $last_paren = strrpos($stat_content, ')');
-                        if ($last_paren !== false) {
-                            $fields = explode(' ', substr($stat_content, $last_paren + 2));
-                            if (count($fields) >= 12) {
-                                $utime = (int)$fields[11];
-                                $stime = (int)$fields[12];
-                                $cpu_stats[$pid] = ['utime' => $utime, 'stime' => $stime, 'clk_tck' => $clk_tck];
-                            }
-                        }
-                    }
-                }
-            }
-            return $cpu_stats;
-        };
-
-        // First reading
-        $prev_proc = $read_proc_cpu($proc_pids);
-        $prev_time_proc = microtime(true);
-        usleep(200000); // 200ms delay
-
-        // Second reading
+        // Calculate process CPU usage delta using previous loop snapshot
         $curr_proc = $read_proc_cpu($proc_pids);
         $curr_time_proc = microtime(true);
         $proc_interval = $curr_time_proc - $prev_time_proc;
 
         // Calculate CPU usage delta for each process
-        if ($proc_interval > 0) {
+        if ($proc_interval > 0 && !empty($prev_proc)) {
             foreach ($proc_pids as $pid) {
                 if (isset($curr_proc[$pid]) && isset($prev_proc[$pid])) {
                     $curr_total = $curr_proc[$pid]['utime'] + $curr_proc[$pid]['stime'];
@@ -437,6 +462,8 @@ if (isset($_GET['stream'])) {
                 }
             }
         }
+        $prev_proc = $curr_proc;
+        $prev_time_proc = $curr_time_proc;
 
         // Re-sort by real-time CPU usage
         usort($stats['processes'], function($a, $b) {
@@ -461,14 +488,16 @@ if (isset($_GET['stream'])) {
         $gpus = [];
 
         // NVIDIA first: one entry per physical GPU (CSV fields may contain commas — use str_getcsv)
-        $nvidia_csv = shell_exec('nvidia-smi --query-gpu=index,name,utilization.gpu,utilization.memory,memory.total,memory.used,temperature.gpu,clocks.current.graphics --format=csv,noheader,nounits 2>/dev/null');
+        // Include power draw/limit + throttle reasons so we can show Power and Limit info on the card
+        $nvidia_csv = shell_exec('nvidia-smi --query-gpu=index,name,utilization.gpu,utilization.memory,memory.total,memory.used,temperature.gpu,clocks.current.graphics,power.draw,power.limit,clocks_throttle_reasons.active --format=csv,noheader,nounits 2>/dev/null');
         if ($nvidia_csv !== null && trim($nvidia_csv) !== '') {
             foreach (explode("\n", trim($nvidia_csv)) as $line) {
                 if ($line === '') {
                     continue;
                 }
                 $p = str_getcsv($line);
-                if (count($p) < 8) {
+                // Minimum fields we need for Power: index,name,utilization.gpu,utilization.memory,memory.total,memory.used,temperature.gpu,clocks.current.graphics,power.draw,power.limit
+                if (count($p) < 10) {
                     continue;
                 }
                 $mem_total_mib = (float)trim($p[4]);
@@ -478,8 +507,48 @@ if (isset($_GET['stream'])) {
                 $mem_used_pct = $mem_total_mib > 0 ? (int)round($mem_used_mib / $mem_total_mib * 100) : 0;
                 $temp_raw = trim($p[6]);
                 $freq_raw = trim($p[7]);
+                $pwr_draw_raw = trim($p[8]);
+                $pwr_cap_raw = trim($p[9]);
+                $limit_reason_raw = count($p) > 10 ? trim($p[10]) : '';
+                $limit_reason = ($limit_reason_raw !== '' && strtolower($limit_reason_raw) !== 'n/a') ? $limit_reason_raw : null;
                 $temp = preg_match('/^[\d.]+$/', $temp_raw) ? (float)$temp_raw : 0;
                 $freq = preg_match('/^[\d.]+$/', $freq_raw) ? (int)$freq_raw : 0;
+                $pwr_draw = preg_match('/^[\d.]+$/', $pwr_draw_raw) ? (float)$pwr_draw_raw : null;
+                $pwr_cap = preg_match('/^[\d.]+$/', $pwr_cap_raw) ? (float)$pwr_cap_raw : null;
+
+                // Map clocks_throttle_reasons.active hex bitmask to human-readable English reasons
+                $limit_reason = null;
+                $mask_str = strtolower($limit_reason_raw);
+                if ($mask_str !== '' && $mask_str !== 'n/a' && preg_match('/^0x[0-9a-f]+$/', $mask_str)) {
+                    $mask_val = hexdec($mask_str);
+                    $reason_map = [
+                        0x0000000000000000 => 'None',
+                        0x0000000000000001 => 'GPU Idle',
+                        0x0000000000000002 => 'Applications Clocks Setting',
+                        0x0000000000000004 => 'SW Power Cap',
+                        0x0000000000000008 => 'HW Slowdown',
+                        0x0000000000000010 => 'Sync Boost',
+                        0x0000000000000020 => 'SW Thermal Slowdown',
+                        0x0000000000000040 => 'HW Thermal Slowdown',
+                        0x0000000000000080 => 'HW Power Brake Slowdown',
+                        0x0000000000000100 => 'Display Clock Setting',
+                    ];
+
+                    if ($mask_val === 0 && isset($reason_map[0])) {
+                        $limit_reason = $reason_map[0];
+                    } else {
+                        $reasons = [];
+                        foreach ($reason_map as $bit => $label) {
+                            if ($bit === 0) continue;
+                            if (($mask_val & $bit) !== 0) {
+                                $reasons[] = $label;
+                            }
+                        }
+                        if (!empty($reasons)) {
+                            $limit_reason = implode(', ', $reasons);
+                        }
+                    }
+                }
                 $gpus[] = [
                     'index' => (int)trim($p[0]),
                     'name' => trim($p[1]),
@@ -491,6 +560,9 @@ if (isset($_GET['stream'])) {
                     'memory' => ['used' => $mem_used_bytes, 'total' => $mem_total_bytes],
                     'temp' => $temp,
                     'freq' => $freq,
+                    'power_draw' => $pwr_draw,
+                    'power_cap' => $pwr_cap,
+                    'limit_reason' => $limit_reason,
                 ];
             }
         }
@@ -628,7 +700,7 @@ if (isset($_GET['stream'])) {
         
         // Method 6: Intel xpu-smi (Better VRAM/Util if available)
         if (file_exists('/usr/bin/xpu-smi')) {
-            $xpu = shell_exec('xpu-smi stats --json 2>/dev/null');
+            $xpu = shell_exec('timeout 0.3 xpu-smi stats --json 2>/dev/null');
             $data = json_decode($xpu, true);
             if ($data && isset($data[0]['GPU'])) {
                 $gpu['available'] = true;
@@ -697,7 +769,8 @@ if (isset($_GET['stream'])) {
                 'os' => ['distro' => $distro, 'release' => $kernel, 'arch' => $arch],
                 'uptime' => $uptime,
                 'load' => $stats['load'],
-                'network' => ['interfaces' => $ips]
+                'network' => ['interfaces' => $ips],
+                'host' => $hostname,
             ]
         ]) . "\n\n";
 
@@ -719,7 +792,7 @@ if (isset($_GET['stream'])) {
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Server Resource Monitor</title>
+    <title>Server Resource Monitor<?php echo $hostname ? ' - ' . htmlspecialchars($hostname, ENT_QUOTES, 'UTF-8') : ''; ?></title>
     <link href="https://fonts.googleapis.com/css2?family=Roboto:wght@300;400;500;700&display=swap" rel="stylesheet">
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css">
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
@@ -783,9 +856,12 @@ if (isset($_GET['stream'])) {
         .gpu .gpu-meter { flex: 1; min-width: 0; }
         .gpu .progress-label-row { display: flex; justify-content: space-between; align-items: center; font-size: 12px; margin-bottom: 4px; color: #aaa; }
         .gpu .progress-label-row span:last-child { font-weight: 600; color: #e0e0e0; }
+        .gpu .gpu-meter-value { font-size: 24px; font-weight: 700; line-height: 1; }
+        .gpu .gpu-nv-stats { grid-template-columns: 1fr 1fr 1fr; }
         #cpu-cards-container { display: contents; }
-        #gpu-cards-container { display: none; }
-        #gpu-cards-container.gpu-cards-visible { display: contents; }
+        .gpu-grid { display: none; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 20px; margin-bottom: 20px; }
+        .gpu-grid.gpu-cards-visible { display: grid; }
+        #gpu-cards-container { display: contents; }
         .gpu .gpu-charts-row { display: flex; gap: 10px; align-items: stretch; }
         .gpu .gpu-chart-wrap { flex: 1; min-width: 0; }
         .gpu .gpu-chart-caption { font-size: 10px; color: #888; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 2px; }
@@ -849,7 +925,7 @@ if (isset($_GET['stream'])) {
     <div class="container">
         <div id="connection-status"></div>
         <header>
-            <h1><i class="fas fa-chart-line"></i> Server Resource Monitor</h1>
+            <h1 id="page-title"><i class="fas fa-chart-line"></i> Server Resource Monitor<?php echo $hostname ? ' - ' . htmlspecialchars($hostname, ENT_QUOTES, 'UTF-8') : ''; ?></h1>
             <div class="timestamp" id="current-time">Connecting...</div>
         </header>
 
@@ -931,7 +1007,10 @@ if (isset($_GET['stream'])) {
                 <div class="card-chart-area"><div class="chart-container"><canvas id="network-chart"></canvas></div></div>
             </div>
 
-            <!-- GPU cards (one per device; populated by JS) -->
+        </div>
+        
+        <!-- GPU cards on separate row/grid -->
+        <div class="gpu-grid" id="gpu-grid">
             <div id="gpu-cards-container"></div>
         </div>
 
@@ -996,6 +1075,11 @@ if (isset($_GET['stream'])) {
             const k = 1024, sizes = ['B', 'KB', 'MB', 'GB', 'TB'], i = Math.floor(Math.log(bytes) / Math.log(k));
             return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
         };
+        const formatGiBCompact = (bytes) => {
+            const gb = bytes / (1024 ** 3);
+            const txt = gb >= 10 ? gb.toFixed(1) : gb.toFixed(2);
+            return txt.replace(/\.?0+$/, '') + 'GB';
+        };
 
         const createChart = (id, color, label, max = 100, isBytes = false) => new Chart(document.getElementById(id).getContext('2d'), {
             type: 'line',
@@ -1031,11 +1115,11 @@ if (isset($_GET['stream'])) {
                 <div class="card-content">
                     <div class="gpu-meters-row">
                         <div class="gpu-meter">
-                            <div class="progress-label-row"><span>GPU</span><span id="gpu-load-pct-${i}">0%</span></div>
+                            <div class="progress-label-row"><span>GPU</span><span class="gpu-meter-value" id="gpu-load-pct-${i}">0%</span></div>
                             <div class="progress-container"><div class="progress-bar gpu-load-bar" id="gpu-load-bar-${i}" style="width:0%"></div></div>
                         </div>
                         <div class="gpu-meter">
-                            <div class="progress-label-row"><span>VRAM</span><span id="gpu-vram-pct-${i}">0%</span></div>
+                            <div class="progress-label-row"><span>VRAM</span><span class="gpu-meter-value" id="gpu-vram-pct-${i}">0GB/0GB</span></div>
                             <div class="progress-container"><div class="progress-bar gpu-vram-bar" id="gpu-vram-bar-${i}" style="width:0%"></div></div>
                         </div>
                     </div>
@@ -1057,15 +1141,16 @@ if (isset($_GET['stream'])) {
 
         const updateGpuSection = (gpuPayload) => {
             const container = document.getElementById('gpu-cards-container');
+            const gpuGrid = document.getElementById('gpu-grid');
             const gpus = (gpuPayload && gpuPayload.gpus) ? gpuPayload.gpus : [];
             const visible = gpus.length > 0 && gpus[0].name && !String(gpus[0].name).includes('Unknown GPU');
             if (!visible) {
-                container.classList.remove('gpu-cards-visible');
+                gpuGrid.classList.remove('gpu-cards-visible');
                 container.innerHTML = '';
                 destroyGpuCharts();
                 return;
             }
-            container.classList.add('gpu-cards-visible');
+            gpuGrid.classList.add('gpu-cards-visible');
             if (container.children.length !== gpus.length) {
                 container.innerHTML = '';
                 destroyGpuCharts();
@@ -1078,13 +1163,22 @@ if (isset($_GET['stream'])) {
                         scales: { x: { display: false }, y: { min: 0, max: 100, ticks: { callback: v => v + '%' } } }
                     }
                 });
+                const gpuVramLineOpts = () => ({
+                    type: 'line',
+                    data: { labels: Array(30).fill(''), datasets: [{ label: 'VRAM', data: Array(30).fill(0), borderColor: '#69f0ae', backgroundColor: '#69f0ae1A', tension: 0.4, borderWidth: 2, pointRadius: 0 }] },
+                    options: {
+                        responsive: true, maintainAspectRatio: false, animation: false,
+                        plugins: { legend: { display: false } },
+                        scales: { x: { display: false }, y: { min: 0, max: 8 * 1024 ** 3, ticks: { callback: v => formatBytes(v) } } }
+                    }
+                });
                 gpus.forEach((g, i) => {
                     container.insertAdjacentHTML('beforeend', buildGpuCardHtml(i));
                     const ctxGpu = document.getElementById('gpu-chart-' + i).getContext('2d');
                     const ctxVram = document.getElementById('gpu-vram-chart-' + i).getContext('2d');
                     gpuCharts.set(i, {
                         gpu: new Chart(ctxGpu, gpuLineOpts('#00e676', 'GPU')),
-                        vram: new Chart(ctxVram, gpuLineOpts('#69f0ae', 'VRAM'))
+                        vram: new Chart(ctxVram, gpuVramLineOpts())
                     });
                 });
             }
@@ -1093,12 +1187,19 @@ if (isset($_GET['stream'])) {
                 const isNv = g.vendor === 'nvidia';
                 if (grid && grid.dataset.built !== (isNv ? 'nv' : 'oth')) {
                     grid.dataset.built = isNv ? 'nv' : 'oth';
+                    // NVIDIA: stats in 3 columns (rightmost columns are VRAM related)
+                    if (isNv) grid.classList.add('gpu-nv-stats');
+                    else grid.classList.remove('gpu-nv-stats');
                     if (isNv) {
                         grid.innerHTML = `
                             <div class="stat-box"><span class="stat-label">Temp</span><span class="stat-value" id="gpu-temp-${i}">--°C</span></div>
                             <div class="stat-box"><span class="stat-label">Clock</span><span class="stat-value" id="gpu-clock-${i}">-- MHz</span></div>
                             <div class="stat-box"><span class="stat-label">VRAM</span><span class="stat-value" id="gpu-vram-detail-${i}">--</span></div>
-                            <div class="stat-box"><span class="stat-label">VRAM controller</span><span class="stat-value" id="gpu-mem-ctrl-${i}">--%</span></div>`;
+                            <div class="stat-box"><span class="stat-label">Power</span><span class="stat-value" id="gpu-power-${i}">--</span></div>
+                            <div class="stat-box"><span class="stat-label">Throttling reason</span><span class="stat-value" id="gpu-limit-${i}">--</span></div>`;
+                        // Note: memory controller utilization must be the rightmost item per row (3-column grid)
+                        grid.innerHTML += `
+                            <div class="stat-box"><span class="stat-label">VRAM Ctrl Util</span><span class="stat-value" id="gpu-mem-ctrl-${i}">--%</span></div>`;
                     } else {
                         grid.innerHTML = `
                             <div class="stat-box"><span class="stat-label">Frequency</span><span class="stat-value" id="gpu-freq-${i}">-- MHz</span></div>
@@ -1107,13 +1208,19 @@ if (isset($_GET['stream'])) {
                     }
                 }
                 const gpuIdx = (g.index !== undefined && g.index !== null) ? g.index : i;
-                const gpuTitleName = String(g.name || '').replace(/^GPU:\s*/i, '').trim() || 'Unknown';
-                document.getElementById('gpu-title-' + i).textContent = 'GPU' + gpuIdx + ' · ' + gpuTitleName;
+                const rawGpuName = String(g.name || 'GPU').trim();
+                document.getElementById('gpu-title-' + i).textContent = 'GPU' + gpuIdx + ' · ' + rawGpuName;
                 if (g.available === false) {
                     document.getElementById('gpu-load-pct-' + i).textContent = 'N/A';
                     document.getElementById('gpu-load-bar-' + i).style.width = '0%';
-                    document.getElementById('gpu-vram-pct-' + i).textContent = 'N/A';
+                    document.getElementById('gpu-vram-pct-' + i).textContent = '--/--';
                     document.getElementById('gpu-vram-bar-' + i).style.width = '0%';
+                    const powerNA = document.getElementById('gpu-power-' + i);
+                    if (powerNA) powerNA.textContent = '--';
+                    const limitNA = document.getElementById('gpu-limit-' + i);
+                    if (limitNA) limitNA.textContent = '--';
+                    const memCtrlNA = document.getElementById('gpu-mem-ctrl-' + i);
+                    if (memCtrlNA) memCtrlNA.textContent = '--';
                     document.getElementById('gpu-status-' + i).className = 'status-indicator status-warning';
                     return;
                 }
@@ -1122,8 +1229,9 @@ if (isset($_GET['stream'])) {
                 document.getElementById('gpu-load-pct-' + i).textContent = loadPct + '%';
                 updateTextStatus(document.getElementById('gpu-load-pct-' + i), loadPct);
                 document.getElementById('gpu-load-bar-' + i).style.width = Math.min(100, loadPct) + '%';
-                document.getElementById('gpu-vram-pct-' + i).textContent = vramPct + '%';
-                updateTextStatus(document.getElementById('gpu-vram-pct-' + i), vramPct);
+                const vramUsed = (g.memory && g.memory.used) ? g.memory.used : 0;
+                const vramTotal = (g.memory && g.memory.total) ? g.memory.total : 0;
+                document.getElementById('gpu-vram-pct-' + i).textContent = vramTotal > 0 ? (formatGiBCompact(vramUsed) + '/' + formatGiBCompact(vramTotal)) : '--/--';
                 document.getElementById('gpu-vram-bar-' + i).style.width = Math.min(100, vramPct) + '%';
                 const vramDetail = (g.memory && g.memory.total > 0)
                     ? formatBytes(g.memory.used) + ' / ' + formatBytes(g.memory.total)
@@ -1135,8 +1243,28 @@ if (isset($_GET['stream'])) {
                 if (isNv) {
                     const clk = document.getElementById('gpu-clock-' + i);
                     if (clk) clk.textContent = (g.freq > 0) ? (g.freq + ' MHz') : '-- MHz';
-                    const mc = document.getElementById('gpu-mem-ctrl-' + i);
-                    if (mc && g.memory_utilization != null) mc.textContent = Math.round(g.memory_utilization) + '%';
+                    const pwrEl = document.getElementById('gpu-power-' + i);
+                    if (pwrEl) {
+                        const pd = g.power_draw;
+                        const pc = g.power_cap;
+                        if (pd != null && pc != null && pc > 0) {
+                            pwrEl.textContent = `${pd.toFixed(0)}/${pc.toFixed(0)} W`;
+                        } else if (pd != null) {
+                            pwrEl.textContent = `${pd.toFixed(0)} W`;
+                        } else {
+                            pwrEl.textContent = '--';
+                        }
+                    }
+                    const limitEl = document.getElementById('gpu-limit-' + i);
+                    if (limitEl) {
+                        limitEl.textContent = g.limit_reason ? g.limit_reason : '--';
+                    }
+                    const memCtrlEl = document.getElementById('gpu-mem-ctrl-' + i);
+                    if (memCtrlEl) {
+                        const mc = g.memory_utilization;
+                        if (mc !== null && mc !== undefined) memCtrlEl.textContent = Math.round(mc) + '%';
+                        else memCtrlEl.textContent = '--%';
+                    }
                 } else {
                     const fq = document.getElementById('gpu-freq-' + i);
                     if (fq) {
@@ -1153,7 +1281,8 @@ if (isset($_GET['stream'])) {
                     pair.gpu.data.datasets[0].data.push(loadPct);
                     pair.gpu.update('none');
                     pair.vram.data.datasets[0].data.shift();
-                    pair.vram.data.datasets[0].data.push(vramPct);
+                    pair.vram.data.datasets[0].data.push(vramUsed);
+                    pair.vram.options.scales.y.max = Math.max(vramTotal || 0, ...pair.vram.data.datasets[0].data, 1) * 1.1;
                     pair.vram.update('none');
                 }
             });
@@ -1342,6 +1471,15 @@ if (isset($_GET['stream'])) {
             statusEl.style.display = 'none';
             const d = JSON.parse(e.data);
             document.getElementById('current-time').textContent = new Date(d.timestamp).toLocaleTimeString();
+            if (d.system && d.system.host) {
+                const baseTitle = 'Server Resource Monitor';
+                const hostSuffix = ' - ' + d.system.host;
+                document.title = baseTitle + hostSuffix;
+                const h1 = document.getElementById('page-title');
+                if (h1) {
+                    h1.innerHTML = '<i class=\"fas fa-chart-line\"></i> ' + baseTitle + hostSuffix;
+                }
+            }
             
             // CPU (one card per physical socket)
             updateCpuSection(d.cpu);

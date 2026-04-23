@@ -46,6 +46,59 @@ The dashboard is protected by a simple password layer to prevent unauthorized ac
 - **SSE Connection Lost**: Check if your web server (like Nginx) has buffering enabled. The script attempts to disable it with `X-Accel-Buffering: no`, but some configurations might require manual adjustment.
 - **GPU Stats Missing**: Ensure the necessary drivers and monitoring tools (`nvidia-smi`, `intel_gpu_top`, etc.) are installed and accessible by the PHP user.
 
+### Recommended Nginx + PHP-FPM Settings (for stable SSE)
+
+Use these settings to reduce random SSE disconnects and avoid frequent re-login caused by dropped long connections.
+
+#### Nginx (location for `index.php`)
+
+```nginx
+location = /index.php {
+    include fastcgi_params;
+    fastcgi_param SCRIPT_FILENAME $document_root/index.php;
+    fastcgi_pass unix:/run/php/php8.5-fpm.sock;
+
+    # SSE stability
+    fastcgi_buffering off;
+    fastcgi_request_buffering off;
+    gzip off;
+
+    # Long-lived stream
+    fastcgi_read_timeout 1h;
+    fastcgi_send_timeout 1h;
+    send_timeout 1h;
+}
+```
+
+#### Nginx (global / server level)
+
+```nginx
+proxy_read_timeout 1h;
+proxy_send_timeout 1h;
+keepalive_timeout 75s;
+```
+
+#### PHP-FPM (`php.ini` / pool settings)
+
+```ini
+max_execution_time = 0
+output_buffering = Off
+zlib.output_compression = Off
+session.gc_maxlifetime = 43200
+```
+
+```ini
+; in php-fpm pool (www.conf)
+request_terminate_timeout = 0
+```
+
+After updating configs, reload services:
+
+```bash
+sudo systemctl reload nginx
+sudo systemctl reload php8.5-fpm
+```
+
 ## 📄 License
 
 This project is open-source. Feel free to modify and distribute as needed.
