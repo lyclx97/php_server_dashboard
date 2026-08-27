@@ -1,27 +1,702 @@
 <?php
 /**
- * Server Resource Monitor - Single File PHP Version
- * Targeted for Linux Platform
+ * Server Resource Monitor - Single-file Linux deployment
+ *
+ * Requirements:
+ *   - Nginx or Apache with PHP-FPM/CGI
+ *   - PHP extensions: sysvshm, sysvsem and curl
+ *   - No Docker, database, application config or runtime data files are required
+ *
+ * Ubuntu/Debian example (systemd, default site):
+ *   sudo install -o root -g www-data -m 0640 index.php /var/www/html/index.php
+ *   sudo php /var/www/html/index.php --configure \
+ *     --central-url=https://monitor.example.com --node-id= --sample-interval=3
+ *   sudo php /var/www/html/index.php --install-agent
+ *
+ * Alpine example (OpenRC, named monitor page):
+ *   doas install -o root -g nobody -m 0640 monitor.php /var/www/default/monitor.php
+ *   doas php83 /var/www/default/monitor.php --configure \
+ *     --central-url=https://monitor.example.com --node-id= --sample-interval=3
+ *   doas php83 /var/www/default/monitor.php --install-agent
+ *
+ * The --install-agent command automatically installs or updates the appropriate
+ * systemd/OpenRC service and starts the Agent. Use --agent to run it in the
+ * foreground. central-url may be a site root or a PHP path, for example:
+ *   https://monitor.example.com
+ *   http://192.168.1.20/monitor.php
+ *
+ * An empty node-id uses the machine hostname. Configuration is embedded in this
+ * PHP file. Node state, detail leases, Agent status and login sessions live only
+ * in SysV shared memory and may be rebuilt after a reboot.
  */
+
+// Replace both placeholders before deployment. Every reporting node connected
+// to the same central dashboard must currently use the same connection key.
+$PROTECTED_PASSWORD = 'CHANGE_THIS_DASHBOARD_PASSWORD';
+$MONITOR_CONNECTION_KEY = 'CHANGE_THIS_MONITOR_CONNECTION_KEY';
+$monitorCredentialsConfigured = !str_starts_with($PROTECTED_PASSWORD, 'CHANGE_THIS_')
+    && !str_starts_with($MONITOR_CONNECTION_KEY, 'CHANGE_THIS_');
+
+/* MONITOR_EMBEDDED_SETTINGS
+{"node_id":"","central_url":"","group_name":"","sample_interval":3}
+MONITOR_EMBEDDED_SETTINGS_END */
+
+// --- Distributed monitor configuration and transport ---
+function monitorSharedKey(): int {
+    static $key = null;
+    if ($key === null) {
+        $path = realpath(__FILE__) ?: __FILE__;
+        $key = 0x10000000 + hexdec(substr(hash('sha256', $path), 0, 7));
+    }
+    return $key;
+}
+
+function monitorSharedState(array $state): array {
+    return [
+        'nodes' => is_array($state['nodes'] ?? null) ? $state['nodes'] : [],
+        'subscriptions' => is_array($state['subscriptions'] ?? null) ? $state['subscriptions'] : [],
+        'agent_status' => is_array($state['agent_status'] ?? null) ? $state['agent_status'] : [],
+        'sessions' => is_array($state['sessions'] ?? null) ? $state['sessions'] : [],
+    ];
+}
+
+function monitorSharedMutate(callable $mutator): mixed {
+    if (!function_exists('shm_attach') || !function_exists('sem_get')) {
+        throw new RuntimeException('The SysV shared memory extensions are unavailable.');
+    }
+    $key = monitorSharedKey();
+    $semaphore = @sem_get($key, 1, 0660, true);
+    if ($semaphore === false || !@sem_acquire($semaphore)) {
+        throw new RuntimeException('Unable to lock shared monitor state.');
+    }
+    $memory = null;
+    try {
+        $memory = @shm_attach($key, 32 * 1024 * 1024, 0660);
+        if ($memory === false) throw new RuntimeException('Unable to attach shared monitor state.');
+        $state = shm_has_var($memory, 1) ? monitorSharedState((array)@shm_get_var($memory, 1)) : monitorSharedState([]);
+        $result = $mutator($state);
+        if (!@shm_put_var($memory, 1, monitorSharedState($state))) {
+            throw new RuntimeException('Unable to update shared monitor state.');
+        }
+        return $result;
+    } finally {
+        if ($memory !== null && $memory !== false) @shm_detach($memory);
+        @sem_release($semaphore);
+    }
+}
+
+function monitorSharedRead(): array {
+    try {
+        return monitorSharedMutate(static fn(array &$state): array => $state);
+    } catch (Throwable) {
+        return monitorSharedState([]);
+    }
+}
+
+function monitorSetAgentStatus(array $status): void {
+    try {
+        monitorSharedMutate(static function(array &$state) use ($status): void {
+            $state['agent_status'] = $status;
+        });
+    } catch (Throwable) {
+        // A transient shared-memory failure must not stop the reporting loop.
+    }
+}
+
+function monitorUseSharedSessions(): void {
+    session_set_save_handler(new class implements SessionHandlerInterface {
+        public function open(string $path, string $name): bool { return true; }
+        public function close(): bool { return true; }
+
+        public function read(string $id): string|false {
+            $session = monitorSharedRead()['sessions'][$id] ?? null;
+            if (!is_array($session)) return '';
+            if (time() - (int)($session['updated_at'] ?? 0) > (int)ini_get('session.gc_maxlifetime')) return '';
+            return (string)($session['data'] ?? '');
+        }
+
+        public function write(string $id, string $data): bool {
+            try {
+                monitorSharedMutate(static function(array &$state) use ($id, $data): void {
+                    $state['sessions'][$id] = ['data' => $data, 'updated_at' => time()];
+                });
+                return true;
+            } catch (Throwable) {
+                return false;
+            }
+        }
+
+        public function destroy(string $id): bool {
+            try {
+                monitorSharedMutate(static function(array &$state) use ($id): void {
+                    unset($state['sessions'][$id]);
+                });
+                return true;
+            } catch (Throwable) {
+                return false;
+            }
+        }
+
+        public function gc(int $max_lifetime): int|false {
+            try {
+                return monitorSharedMutate(static function(array &$state) use ($max_lifetime): int {
+                    $removed = 0;
+                    foreach ($state['sessions'] as $id => $session) {
+                        if (time() - (int)($session['updated_at'] ?? 0) > $max_lifetime) {
+                            unset($state['sessions'][$id]);
+                            $removed++;
+                        }
+                    }
+                    return $removed;
+                });
+            } catch (Throwable) {
+                return false;
+            }
+        }
+    }, true);
+}
+
+function monitorInstallAgentService(string $scriptPath): never {
+    if (!function_exists('posix_geteuid') || posix_geteuid() !== 0) {
+        fwrite(STDERR, "Run this command with sudo.\n");
+        exit(1);
+    }
+    $scriptPath = realpath($scriptPath) ?: $scriptPath;
+    $quote = static fn(string $value): string => '"' . str_replace(['\\', '"'], ['\\\\', '\\"'], $value) . '"';
+    $serviceUser = 'www-data';
+    $serviceGroup = 'www-data';
+    foreach (glob('/etc/php*/php-fpm.d/www.conf') ?: [] as $poolPath) {
+        $pool = (string)@file_get_contents($poolPath);
+        if (preg_match('/^\s*user\s*=\s*([^;\s]+)/m', $pool, $match)) $serviceUser = $match[1];
+        if (preg_match('/^\s*group\s*=\s*([^;\s]+)/m', $pool, $match)) $serviceGroup = $match[1];
+        break;
+    }
+    if (function_exists('posix_getpwnam') && posix_getpwnam($serviceUser) === false) {
+        $serviceUser = posix_getpwnam('nginx') !== false ? 'nginx' : 'nobody';
+    }
+    if (function_exists('posix_getgrnam') && posix_getgrnam($serviceGroup) === false) $serviceGroup = $serviceUser;
+
+    if (is_executable('/sbin/openrc-run') && is_executable('/sbin/rc-service')) {
+        $servicePath = '/etc/init.d/linxi-monitor-agent';
+        $init = "#!/sbin/openrc-run\n"
+            . "description=\"Linxi distributed monitor agent\"\n"
+            . "command=" . $quote(PHP_BINARY) . "\n"
+            . "command_args=" . $quote($quote($scriptPath) . ' --agent') . "\n"
+            . "command_user=" . $quote($serviceUser . ':' . $serviceGroup) . "\n"
+            . "supervisor=\"supervise-daemon\"\n"
+            . "respawn_delay=5\n"
+            . "respawn_max=0\n\n"
+            . "depend() {\n"
+            . "    need net\n"
+            . "    after nginx php-fpm83\n"
+            . "}\n";
+        if (file_put_contents($servicePath, $init, LOCK_EX) === false) {
+            fwrite(STDERR, "Unable to write $servicePath.\n");
+            exit(1);
+        }
+        chmod($servicePath, 0755);
+        system('rc-update add linxi-monitor-agent default', $updateStatus);
+        system('rc-service linxi-monitor-agent restart', $startStatus);
+        if ($updateStatus !== 0 || $startStatus !== 0) exit(1);
+        echo "Managed OpenRC Agent service installed and started.\n";
+        exit;
+    }
+
+    $unit = "[Unit]\n"
+        . "Description=Linxi distributed monitor agent\n"
+        . "After=network-online.target nginx.service php8.5-fpm.service\n"
+        . "Wants=network-online.target\n\n"
+        . "[Service]\n"
+        . "Type=simple\n"
+        . "User=" . $serviceUser . "\n"
+        . "Group=" . $serviceGroup . "\n"
+        . "ExecStart=" . $quote(PHP_BINARY) . ' ' . $quote($scriptPath) . " --agent\n"
+        . "Restart=always\n"
+        . "RestartSec=5\n"
+        . "NoNewPrivileges=true\n"
+        . "PrivateTmp=true\n"
+        . "ProtectSystem=full\n\n"
+        . "[Install]\n"
+        . "WantedBy=multi-user.target\n";
+    $servicePath = '/etc/systemd/system/linxi-monitor-agent.service';
+    if (file_put_contents($servicePath, $unit, LOCK_EX) === false) {
+        fwrite(STDERR, "Unable to write $servicePath.\n");
+        exit(1);
+    }
+    chmod($servicePath, 0644);
+    system('systemctl daemon-reload', $reloadStatus);
+    system('systemctl enable --now linxi-monitor-agent.service', $enableStatus);
+    if ($reloadStatus !== 0 || $enableStatus !== 0) exit(1);
+    echo "Managed Agent service installed and started.\n";
+    exit;
+}
+
+function monitorConfig(string $scriptPath): array {
+    $defaults = [
+        'node_id' => php_uname('n') ?: 'linux-node',
+        'central_url' => '',
+        'group_name' => '',
+        'sample_interval' => 3,
+    ];
+    $handle = @fopen($scriptPath, 'rb');
+    if (!$handle) return $defaults;
+    @flock($handle, LOCK_SH);
+    $source = stream_get_contents($handle);
+    @flock($handle, LOCK_UN);
+    fclose($handle);
+    if (!preg_match('#/\* MONITOR_EMBEDDED_SETTINGS\R(.*?)\RMONITOR_EMBEDDED_SETTINGS_END \*/#s', (string)$source, $match)) return $defaults;
+    $stored = json_decode(trim($match[1]), true);
+    if (!is_array($stored)) return $defaults;
+    $config = array_replace($defaults, $stored);
+    if (trim((string)$config['node_id']) === '') $config['node_id'] = $defaults['node_id'];
+    $config['group_name'] = monitorNormalizeGroupName($config['group_name'] ?? '');
+    $config['sample_interval'] = max(2, min(30, (int)$config['sample_interval']));
+    return $config;
+}
+
+function monitorNormalizeGroupName(mixed $value): string {
+    if (!is_string($value)) return '';
+    $name = trim((string)(preg_replace('/[\x00-\x1F\x7F]/u', '', $value) ?? ''));
+    return function_exists('mb_substr') ? mb_substr($name, 0, 80, 'UTF-8') : substr($name, 0, 160);
+}
+
+function monitorWriteConfig(string $scriptPath, array $config): bool {
+    $handle = @fopen($scriptPath, 'c+');
+    if (!$handle || !@flock($handle, LOCK_EX)) {
+        if ($handle) fclose($handle);
+        return false;
+    }
+    rewind($handle);
+    $source = stream_get_contents($handle);
+    $stored = [
+        'node_id' => (string)$config['node_id'],
+        'central_url' => (string)$config['central_url'],
+        'group_name' => monitorNormalizeGroupName($config['group_name'] ?? ''),
+        'sample_interval' => max(2, min(30, (int)$config['sample_interval'])),
+    ];
+    $replacement = "/* MONITOR_EMBEDDED_SETTINGS\n" . json_encode($stored, JSON_UNESCAPED_SLASHES) . "\nMONITOR_EMBEDDED_SETTINGS_END */";
+    $updated = preg_replace('#/\* MONITOR_EMBEDDED_SETTINGS\R.*?\RMONITOR_EMBEDDED_SETTINGS_END \*/#s', $replacement, (string)$source, 1, $count);
+    $ok = $count === 1 && is_string($updated);
+    if ($ok) {
+        rewind($handle);
+        $ok = ftruncate($handle, 0) && fwrite($handle, $updated) === strlen($updated) && fflush($handle);
+    }
+    @flock($handle, LOCK_UN);
+    fclose($handle);
+    return $ok;
+}
+
+function monitorJsonResponse(array $payload, int $status = 200): never {
+    http_response_code($status);
+    header('Content-Type: application/json; charset=utf-8');
+    header('Cache-Control: no-store');
+    echo json_encode($payload, JSON_UNESCAPED_SLASHES);
+    exit;
+}
+
+function monitorReadCpuCounters(): array {
+    $line = strtok((string)@file_get_contents('/proc/stat'), "\n");
+    $parts = preg_split('/\s+/', trim((string)$line));
+    if (($parts[0] ?? '') !== 'cpu') return ['idle' => 0, 'total' => 0];
+    $values = array_map('intval', array_slice($parts, 1));
+    $idle = ($values[3] ?? 0) + ($values[4] ?? 0);
+    return ['idle' => $idle, 'total' => array_sum($values)];
+}
+
+function monitorReadNetworkCounters(): array {
+    $rx = 0.0;
+    $tx = 0.0;
+    foreach (explode("\n", (string)@file_get_contents('/proc/net/dev')) as $line) {
+        if (!str_contains($line, ':')) continue;
+        [$name, $numbers] = array_map('trim', explode(':', $line, 2));
+        if ($name === 'lo') continue;
+        $parts = preg_split('/\s+/', $numbers);
+        $rx += (float)($parts[0] ?? 0);
+        $tx += (float)($parts[8] ?? 0);
+    }
+    return ['rx' => $rx, 'tx' => $tx];
+}
+
+function monitorReadMemory(): array {
+    $values = [];
+    foreach (explode("\n", (string)@file_get_contents('/proc/meminfo')) as $line) {
+        if (preg_match('/^([A-Za-z_()]+):\s+(\d+)/', $line, $m)) $values[$m[1]] = (float)$m[2] * 1024;
+    }
+    $total = $values['MemTotal'] ?? 0;
+    $available = $values['MemAvailable'] ?? (($values['MemFree'] ?? 0) + ($values['Buffers'] ?? 0) + ($values['Cached'] ?? 0));
+    $swapTotal = $values['SwapTotal'] ?? 0;
+    $swapFree = $values['SwapFree'] ?? 0;
+    return [
+        'used' => max(0, $total - $available),
+        'total' => $total,
+        'percentage' => $total > 0 ? (($total - $available) / $total * 100) : 0,
+        'swap_used' => max(0, $swapTotal - $swapFree),
+        'swap_total' => $swapTotal,
+    ];
+}
+
+function monitorReadTemperature(): ?float {
+    $temps = [];
+    foreach (glob('/sys/class/thermal/thermal_zone*/temp') ?: [] as $path) {
+        $value = (float)trim((string)@file_get_contents($path));
+        if ($value > 1000) $value /= 1000;
+        if ($value > 0 && $value < 150) $temps[] = $value;
+    }
+    return $temps ? max($temps) : null;
+}
+
+function monitorReadGpu(): array {
+    $out = @shell_exec('nvidia-smi --query-gpu=index,name,utilization.gpu,memory.used,memory.total,temperature.gpu --format=csv,noheader,nounits 2>/dev/null');
+    if (!$out) return ['available' => false];
+    $devices = [];
+    foreach (explode("\n", trim($out)) as $line) {
+        $p = array_map('trim', str_getcsv($line));
+        if (count($p) < 6) continue;
+        $devices[] = [
+            'index' => (int)$p[0], 'name' => $p[1], 'usage' => (float)$p[2],
+            'memory_used' => (float)$p[3] * 1048576, 'memory_total' => (float)$p[4] * 1048576,
+            'temperature' => (float)$p[5],
+        ];
+    }
+    if (!$devices) return ['available' => false];
+    return [
+        'available' => true,
+        'usage' => max(array_column($devices, 'usage')),
+        'memory_used' => array_sum(array_column($devices, 'memory_used')),
+        'memory_total' => array_sum(array_column($devices, 'memory_total')),
+        'temperature' => max(array_column($devices, 'temperature')),
+        'devices' => $devices,
+    ];
+}
+
+function monitorStaticInfo(): array {
+    $distro = 'Linux';
+    $osRelease = (string)@file_get_contents('/etc/os-release');
+    if (preg_match('/^PRETTY_NAME=["\']?([^"\'\n]+)["\']?/m', $osRelease, $m)) $distro = trim($m[1]);
+    $cpuModel = 'Unknown CPU';
+    $lscpu = (string)@shell_exec('lscpu 2>/dev/null');
+    if (preg_match('/^(?:BIOS )?Model name:\s*(.+)$/mi', $lscpu, $m)) $cpuModel = trim($m[1]);
+    return [
+        'hostname' => php_uname('n'), 'os' => $distro, 'kernel' => php_uname('r'),
+        'architecture' => php_uname('m'), 'cpu_model' => $cpuModel,
+        'cpu_cores' => (int)trim((string)@shell_exec('getconf _NPROCESSORS_ONLN 2>/dev/null')),
+    ];
+}
+
+function monitorCollectSummary(array &$state): array {
+    $now = microtime(true);
+    $cpu = monitorReadCpuCounters();
+    $network = monitorReadNetworkCounters();
+    $elapsed = max(0.001, $now - ($state['time'] ?? $now));
+    $totalDelta = $cpu['total'] - ($state['cpu']['total'] ?? $cpu['total']);
+    $idleDelta = $cpu['idle'] - ($state['cpu']['idle'] ?? $cpu['idle']);
+    $cpuUsage = $totalDelta > 0 ? max(0, min(100, (1 - $idleDelta / $totalDelta) * 100)) : 0;
+    $rxSpeed = max(0, ($network['rx'] - ($state['network']['rx'] ?? $network['rx'])) / $elapsed);
+    $txSpeed = max(0, ($network['tx'] - ($state['network']['tx'] ?? $network['tx'])) / $elapsed);
+    $state = ['time' => $now, 'cpu' => $cpu, 'network' => $network, 'primed' => $state['primed'] ?? false];
+    $memory = monitorReadMemory();
+    $diskTotal = (float)@disk_total_space('/');
+    $diskFree = (float)@disk_free_space('/');
+    $loads = sys_getloadavg() ?: [0, 0, 0];
+    $uptime = (float)strtok((string)@file_get_contents('/proc/uptime'), ' ');
+    return [
+        'cpu' => ['usage' => round($cpuUsage, 1), 'temperature' => monitorReadTemperature()],
+        'memory' => $memory,
+        'disk' => ['used' => max(0, $diskTotal - $diskFree), 'total' => $diskTotal, 'percentage' => $diskTotal > 0 ? (($diskTotal - $diskFree) / $diskTotal * 100) : 0],
+        'network' => ['rx_speed' => $rxSpeed, 'tx_speed' => $txSpeed, 'rx_total' => $network['rx'], 'tx_total' => $network['tx']],
+        'load' => array_values(array_map(fn($v) => round((float)$v, 2), array_slice($loads, 0, 3))),
+        'uptime' => $uptime,
+        'gpu' => monitorReadGpu(),
+    ];
+}
+
+function monitorPostReport(string $url, string $nodeId, string $secret, array $payload): array {
+    $body = json_encode($payload, JSON_UNESCAPED_SLASHES);
+    $timestamp = (string)time();
+    $signature = hash_hmac('sha256', $timestamp . "\n" . $nodeId . "\n" . $body, $secret);
+    $baseUrl = rtrim($url, '/');
+    $urlPath = (string)(parse_url($baseUrl, PHP_URL_PATH) ?: '');
+    $endpoint = $baseUrl . ($urlPath !== '' && $urlPath !== '/' ? '?' : '/?') . 'monitor_api=ingest';
+    if (function_exists('curl_init')) {
+        $ch = curl_init($endpoint);
+        curl_setopt_array($ch, [
+            CURLOPT_POST => true, CURLOPT_POSTFIELDS => $body, CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_CONNECTTIMEOUT => 8, CURLOPT_TIMEOUT => 15,
+            CURLOPT_HTTPHEADER => ['Content-Type: application/json', 'X-Monitor-Node: ' . $nodeId, 'X-Monitor-Timestamp: ' . $timestamp, 'X-Monitor-Signature: ' . $signature],
+        ]);
+        $response = curl_exec($ch);
+        $status = (int)curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
+        $error = curl_error($ch);
+        curl_close($ch);
+        $decoded = is_string($response) ? json_decode($response, true) : null;
+        return [
+            'ok' => $response !== false && $status >= 200 && $status < 300,
+            'status' => $status, 'error' => $error ?: null,
+            'detail_requested' => !empty($decoded['detail_requested']),
+        ];
+    }
+    $context = stream_context_create(['http' => [
+        'method' => 'POST', 'timeout' => 15, 'ignore_errors' => true, 'content' => $body,
+        'header' => "Content-Type: application/json\r\nX-Monitor-Node: $nodeId\r\nX-Monitor-Timestamp: $timestamp\r\nX-Monitor-Signature: $signature\r\n",
+    ]]);
+    $response = @file_get_contents($endpoint, false, $context);
+    $statusLine = $http_response_header[0] ?? '';
+    preg_match('/\s(\d{3})\s/', $statusLine, $m);
+    $status = (int)($m[1] ?? 0);
+    $decoded = is_string($response) ? json_decode($response, true) : null;
+    return [
+        'ok' => $response !== false && $status >= 200 && $status < 300,
+        'status' => $status, 'error' => $response === false ? 'Connection failed' : null,
+        'detail_requested' => !empty($decoded['detail_requested']),
+    ];
+}
+
+function monitorFetchLocalDetail(): ?array {
+    $context = stream_context_create(['http' => ['timeout' => 15, 'ignore_errors' => true]]);
+    $localPath = '/' . rawurlencode(basename(__FILE__));
+    $stream = @fopen('http://127.0.0.1' . $localPath . '?monitor_agent_stream=1', 'r', false, $context);
+    if (!$stream) return null;
+    stream_set_timeout($stream, 15);
+    $detail = null;
+    while (!feof($stream)) {
+        $line = fgets($stream);
+        if ($line === false) break;
+        if (str_starts_with($line, 'data: ')) {
+            $decoded = json_decode(substr($line, 6), true);
+            if (is_array($decoded)) $detail = $decoded;
+            break;
+        }
+    }
+    fclose($stream);
+    return $detail;
+}
+
+function monitorRunAgent(string $scriptPath, string $connectionKey): never {
+    @set_time_limit(0);
+    $collectorState = [];
+    $staticInfo = monitorStaticInfo();
+    $failureCount = 0;
+    $lastStatic = 0;
+    while (true) {
+        $config = monitorConfig($scriptPath);
+        $url = trim((string)$config['central_url']);
+        $nodeId = preg_replace('/[^A-Za-z0-9._-]/', '-', (string)$config['node_id']);
+        if ($url === '' || $nodeId === '') {
+            monitorSetAgentStatus(['ok' => false, 'updated_at' => time(), 'message' => 'Central connection is not configured']);
+            sleep(10);
+            continue;
+        }
+        $metrics = monitorCollectSummary($collectorState);
+        if (empty($collectorState['primed'])) {
+            $collectorState['primed'] = true;
+            sleep(1);
+            continue;
+        }
+        $payload = [
+            'schema' => 1,
+            'sent_at' => time(),
+            'group_name' => monitorNormalizeGroupName($config['group_name'] ?? ''),
+            'metrics' => $metrics,
+        ];
+        if (time() - $lastStatic >= 3600) $payload['system'] = $staticInfo;
+        $result = monitorPostReport($url, $nodeId, $connectionKey, $payload);
+        if ($result['ok']) {
+            if (!empty($result['detail_requested'])) {
+                $detail = monitorFetchLocalDetail();
+                if ($detail !== null) {
+                    $payload['sent_at'] = time();
+                    $payload['detail'] = $detail;
+                    $detailResult = monitorPostReport($url, $nodeId, $connectionKey, $payload);
+                    if (!$detailResult['ok']) $result = $detailResult;
+                }
+            }
+        }
+        if ($result['ok']) {
+            $failureCount = 0;
+            if (isset($payload['system'])) $lastStatic = time();
+            monitorSetAgentStatus(['ok' => true, 'updated_at' => time(), 'status' => $result['status'], 'message' => 'Connected']);
+            sleep(max(2, min(30, (int)$config['sample_interval'])));
+        } else {
+            $failureCount++;
+            monitorSetAgentStatus(['ok' => false, 'updated_at' => time(), 'status' => $result['status'], 'message' => $result['error'] ?: ('HTTP ' . $result['status'])]);
+            sleep(min(60, max(3, 2 ** min(6, $failureCount))));
+        }
+    }
+}
+
+$monitorConfig = monitorConfig(__FILE__);
+
+function monitorActiveNodes(): array {
+    try {
+        return monitorSharedMutate(static function(array &$state): array {
+            $now = time();
+            foreach ($state['nodes'] as $nodeId => $node) {
+                $receivedAt = is_array($node) ? (int)($node['received_at'] ?? 0) : 0;
+                if ($receivedAt <= 0 || $now - $receivedAt >= 180) {
+                    unset($state['nodes'][$nodeId], $state['subscriptions'][$nodeId]);
+                }
+            }
+            return $state['nodes'];
+        });
+    } catch (Throwable) {
+        return [];
+    }
+}
+
+function monitorListNodes(): array {
+    $nodes = [];
+    foreach (monitorActiveNodes() as $node) {
+        if (!$node || empty($node['node_id']) || !is_array($node['metrics'] ?? null)) continue;
+        $age = max(0, time() - (int)($node['received_at'] ?? 0));
+        $node['age_seconds'] = $age;
+        $node['status'] = $age <= 12 ? 'online' : ($age <= 60 ? 'degraded' : 'offline');
+        $nodes[] = $node;
+    }
+    usort($nodes, function(array $a, array $b): int {
+        $rank = ['online' => 0, 'degraded' => 1, 'offline' => 2];
+        return ($rank[$a['status']] <=> $rank[$b['status']]) ?: strnatcasecmp($a['node_id'], $b['node_id']);
+    });
+    return $nodes;
+}
+
+function monitorOverviewNodes(array &$localCollectorState, array $config, string $hostname, ?array $localSystem = null): array {
+    $localNodeId = preg_replace('/[^A-Za-z0-9._-]/', '-', trim((string)($config['node_id'] ?? '')));
+    if ($localNodeId === '') $localNodeId = preg_replace('/[^A-Za-z0-9._-]/', '-', $hostname) ?: 'local-server';
+
+    // The central server is sampled in-process. It must not run an Agent that
+    // reports back to itself, which would create a duplicate node and a loop.
+    $nodes = array_values(array_filter(
+        monitorListNodes(),
+        static fn(array $node): bool => (string)($node['node_id'] ?? '') !== $localNodeId
+    ));
+    array_unshift($nodes, [
+        'node_id' => $localNodeId,
+        'received_at' => time(),
+        'sent_at' => time(),
+        'age_seconds' => 0,
+        'status' => 'online',
+        'is_local' => true,
+        'group_name' => monitorNormalizeGroupName($config['group_name'] ?? ''),
+        'system' => $localSystem ?? monitorStaticInfo(),
+        'metrics' => monitorCollectSummary($localCollectorState),
+    ]);
+    return $nodes;
+}
+
+function monitorDetectCentral(string $localNodeId): bool {
+    foreach (monitorActiveNodes() as $node) {
+        if (!empty($node['node_id']) && $node['node_id'] !== $localNodeId) return true;
+    }
+    return false;
+}
+
+if (PHP_SAPI === 'cli' && in_array('--configure', $argv ?? [], true)) {
+    $newConfig = $monitorConfig;
+    foreach ($argv as $argument) {
+        if (str_starts_with($argument, '--central-url=')) $newConfig['central_url'] = rtrim(substr($argument, 14), '/');
+        if (str_starts_with($argument, '--node-id=')) $newConfig['node_id'] = preg_replace('/[^A-Za-z0-9._-]/', '-', substr($argument, 10));
+        if (str_starts_with($argument, '--group-name=')) $newConfig['group_name'] = monitorNormalizeGroupName(substr($argument, 13));
+        if (str_starts_with($argument, '--sample-interval=')) $newConfig['sample_interval'] = max(2, min(30, (int)substr($argument, 18)));
+    }
+    if (!monitorWriteConfig(__FILE__, $newConfig)) {
+        fwrite(STDERR, "Unable to update embedded settings.\n");
+        exit(1);
+    }
+    echo "Embedded settings updated.\n";
+    exit;
+}
+
+if (PHP_SAPI === 'cli' && in_array('--install-agent', $argv ?? [], true)) {
+    if (!$monitorCredentialsConfigured) {
+        fwrite(STDERR, "Set the dashboard password and monitor connection key before installing the Agent.\n");
+        exit(1);
+    }
+    monitorInstallAgentService(__FILE__);
+}
+
+if (PHP_SAPI === 'cli' && in_array('--agent', $argv ?? [], true)) {
+    if (!$monitorCredentialsConfigured) {
+        fwrite(STDERR, "Set the dashboard password and monitor connection key before starting the Agent.\n");
+        exit(1);
+    }
+    monitorRunAgent(__FILE__, $MONITOR_CONNECTION_KEY);
+}
+
+// Agent ingestion is authenticated independently and intentionally bypasses browser sessions.
+if (($_GET['monitor_api'] ?? '') === 'ingest') {
+    if (!$monitorCredentialsConfigured) monitorJsonResponse(['ok' => false, 'error' => 'Monitor credentials are not configured'], 503);
+    if ($_SERVER['REQUEST_METHOD'] !== 'POST') monitorJsonResponse(['ok' => false, 'error' => 'Not found'], 404);
+    $body = (string)file_get_contents('php://input');
+    if ($body === '' || strlen($body) > 131072) monitorJsonResponse(['ok' => false, 'error' => 'Invalid payload'], 400);
+    $nodeId = (string)($_SERVER['HTTP_X_MONITOR_NODE'] ?? '');
+    $timestamp = (string)($_SERVER['HTTP_X_MONITOR_TIMESTAMP'] ?? '');
+    $signature = (string)($_SERVER['HTTP_X_MONITOR_SIGNATURE'] ?? '');
+    if (!preg_match('/^[A-Za-z0-9._-]{1,80}$/', $nodeId) || !ctype_digit($timestamp) || abs(time() - (int)$timestamp) > 300) monitorJsonResponse(['ok' => false, 'error' => 'Invalid authentication'], 401);
+    $expected = hash_hmac('sha256', $timestamp . "\n" . $nodeId . "\n" . $body, $MONITOR_CONNECTION_KEY);
+    if ($signature === '' || !hash_equals($expected, $signature)) monitorJsonResponse(['ok' => false, 'error' => 'Invalid authentication'], 401);
+    $report = json_decode($body, true);
+    if (!is_array($report) || !isset($report['metrics']) || !is_array($report['metrics'])) monitorJsonResponse(['ok' => false, 'error' => 'Invalid report'], 422);
+    try {
+        $detailRequested = monitorSharedMutate(static function(array &$state) use ($nodeId, $report): bool {
+            $previous = is_array($state['nodes'][$nodeId] ?? null) ? $state['nodes'][$nodeId] : [];
+            $state['nodes'][$nodeId] = [
+                'node_id' => $nodeId,
+                'received_at' => time(),
+                'sent_at' => (int)($report['sent_at'] ?? time()),
+                'group_name' => monitorNormalizeGroupName($report['group_name'] ?? ''),
+                'system' => is_array($report['system'] ?? null) ? $report['system'] : ($previous['system'] ?? []),
+                'metrics' => $report['metrics'],
+                'detail' => is_array($report['detail'] ?? null) ? $report['detail'] : ($previous['detail'] ?? null),
+                'detail_received_at' => is_array($report['detail'] ?? null) ? time() : (int)($previous['detail_received_at'] ?? 0),
+            ];
+            foreach ($state['subscriptions'] as $subscribedNode => $until) {
+                if ((int)$until < time()) unset($state['subscriptions'][$subscribedNode]);
+            }
+            return (int)($state['subscriptions'][$nodeId] ?? 0) >= time();
+        });
+    } catch (Throwable) {
+        monitorJsonResponse(['ok' => false, 'error' => 'Shared state unavailable'], 503);
+    }
+    $upstreamUrl = trim((string)($monitorConfig['central_url'] ?? ''));
+    $upstreamHost = strtolower((string)(parse_url($upstreamUrl, PHP_URL_HOST) ?: ''));
+    $requestHost = strtolower(preg_replace('/:\d+$/', '', (string)($_SERVER['HTTP_HOST'] ?? $_SERVER['SERVER_NAME'] ?? '')));
+    if ($upstreamUrl !== '' && $upstreamHost !== '' && $upstreamHost !== $requestHost) {
+        $relay = monitorPostReport($upstreamUrl, $nodeId, $MONITOR_CONNECTION_KEY, $report);
+        if ($relay['ok'] && !empty($relay['detail_requested'])) $detailRequested = true;
+    }
+    monitorJsonResponse(['ok' => true, 'server_time' => time(), 'detail_requested' => $detailRequested]);
+}
+
+$monitorTrustedAgentStream = isset($_GET['monitor_agent_stream']) && in_array((string)($_SERVER['REMOTE_ADDR'] ?? ''), ['127.0.0.1', '::1'], true);
+if ($monitorTrustedAgentStream) $_GET['stream'] = 1;
+
+if (!$monitorTrustedAgentStream && !$monitorCredentialsConfigured) {
+    http_response_code(503);
+    header('Content-Type: text/plain; charset=utf-8');
+    header('Cache-Control: no-store');
+    echo "Server Monitor is not configured. Set the dashboard password and monitor connection key in index.php before deployment.\n";
+    exit;
+}
 
 // --- Password Protection ---
 // Keep login session valid longer (12h) to avoid frequent re-login after reconnects.
 $sessionLifetime = 43200;
 ini_set('session.gc_maxlifetime', (string)$sessionLifetime);
+monitorUseSharedSessions();
 $cookieParams = session_get_cookie_params();
 session_set_cookie_params([
     'lifetime' => $sessionLifetime,
     'path' => $cookieParams['path'] ?? '/',
     'domain' => $cookieParams['domain'] ?? '',
-    'secure' => $cookieParams['secure'] ?? false,
+    'secure' => (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off'),
     'httponly' => $cookieParams['httponly'] ?? true,
     'samesite' => $cookieParams['samesite'] ?? 'Lax',
 ]);
 session_start();
-$PROTECTED_PASSWORD = "admin888"; // CHANGE THIS PASSWORD
 
-if (!isset($_SESSION['authenticated'])) {
+if (!$monitorTrustedAgentStream && !isset($_SESSION['authenticated'])) {
     if (isset($_POST['password']) && $_POST['password'] === $PROTECTED_PASSWORD) {
+        session_regenerate_id(true);
         $_SESSION['authenticated'] = true;
         header('Location: ' . $_SERVER['REQUEST_URI']);
         exit;
@@ -73,8 +748,102 @@ ini_set('display_errors', 0);
 
 // Hostname for display
 $hostname = php_uname('n') ?: (function_exists('gethostname') ? gethostname() : '');
+$monitorIsCentral = monitorDetectCentral((string)$monitorConfig['node_id']);
 
 // --- Backend Logic ---
+
+if (empty($_SESSION['monitor_csrf'])) $_SESSION['monitor_csrf'] = bin2hex(random_bytes(24));
+
+if (isset($_POST['monitor_save_config'])) {
+    if (!hash_equals((string)$_SESSION['monitor_csrf'], (string)($_POST['csrf'] ?? ''))) monitorJsonResponse(['ok' => false, 'error' => 'Invalid request'], 403);
+    $centralUrl = trim((string)($_POST['central_url'] ?? ''));
+    if ($centralUrl !== '' && !preg_match('#^https?://#i', $centralUrl)) $centralUrl = 'https://' . $centralUrl;
+    $parts = $centralUrl !== '' ? parse_url($centralUrl) : [];
+    if ($centralUrl !== '' && (!$parts || !in_array(strtolower((string)($parts['scheme'] ?? '')), ['http', 'https'], true) || empty($parts['host']) || isset($parts['user']) || isset($parts['pass']))) {
+        $_SESSION['monitor_config_message'] = ['type' => 'error', 'text' => 'Enter a valid Central server domain or IP address.'];
+    } else {
+        $nodeId = preg_replace('/[^A-Za-z0-9._-]/', '-', trim((string)($_POST['node_id'] ?? $hostname)));
+        $newConfig = $monitorConfig;
+        $newConfig['node_id'] = substr($nodeId ?: $hostname, 0, 80);
+        $newConfig['central_url'] = rtrim($centralUrl, '/');
+        $newConfig['group_name'] = monitorNormalizeGroupName($_POST['group_name'] ?? '');
+        $newConfig['sample_interval'] = max(2, min(30, (int)($_POST['sample_interval'] ?? 3)));
+        if (monitorWriteConfig(__FILE__, $newConfig)) {
+            $monitorConfig = $newConfig;
+            $_SESSION['monitor_config_message'] = ['type' => 'success', 'text' => 'Central connection saved. The Agent service will apply it automatically.'];
+        } else {
+            $_SESSION['monitor_config_message'] = ['type' => 'error', 'text' => 'The configuration could not be saved.'];
+        }
+    }
+    $redirect = strtok((string)$_SERVER['REQUEST_URI'], '?') ?: '/';
+    header('Location: ' . $redirect);
+    exit;
+}
+
+if (($_GET['monitor_api'] ?? '') === 'nodes') {
+    if (!$monitorIsCentral) monitorJsonResponse(['ok' => false, 'error' => 'Not available'], 404);
+    $localCollectorState = [];
+    monitorJsonResponse(['ok' => true, 'server_time' => time(), 'nodes' => monitorOverviewNodes($localCollectorState, $monitorConfig, $hostname)]);
+}
+
+if (($_GET['monitor_api'] ?? '') === 'overview_stream') {
+    if (!$monitorIsCentral) monitorJsonResponse(['ok' => false, 'error' => 'Not available'], 404);
+    @set_time_limit(0);
+    @ini_set('output_buffering', 'off');
+    @ini_set('zlib.output_compression', '0');
+    header('Content-Type: text/event-stream');
+    header('Cache-Control: no-cache, no-transform');
+    header('X-Accel-Buffering: no');
+    echo "retry: 3000\n\n";
+    while (ob_get_level() > 0) @ob_end_flush();
+    @ob_implicit_flush(true);
+    session_write_close();
+    $localCollectorState = [];
+    $localSystem = monitorStaticInfo();
+    while (!connection_aborted()) {
+        echo 'data: ' . json_encode([
+            'server_time' => time(),
+            'nodes' => monitorOverviewNodes($localCollectorState, $monitorConfig, $hostname, $localSystem),
+        ], JSON_UNESCAPED_SLASHES) . "\n\n";
+        flush();
+        sleep(3);
+    }
+    exit;
+}
+
+if (($_GET['monitor_api'] ?? '') === 'remote_stream') {
+    if (!$monitorIsCentral) monitorJsonResponse(['ok' => false, 'error' => 'Not available'], 404);
+    $nodeId = (string)($_GET['node'] ?? '');
+    if (!preg_match('/^[A-Za-z0-9._-]{1,80}$/', $nodeId)) monitorJsonResponse(['ok' => false, 'error' => 'Invalid node'], 400);
+    @set_time_limit(0);
+    @ini_set('output_buffering', 'off');
+    @ini_set('zlib.output_compression', '0');
+    header('Content-Type: text/event-stream');
+    header('Cache-Control: no-cache, no-transform');
+    header('X-Accel-Buffering: no');
+    echo "retry: 3000\n\n";
+    while (ob_get_level() > 0) @ob_end_flush();
+    @ob_implicit_flush(true);
+    session_write_close();
+    while (!connection_aborted()) {
+        try {
+            $node = monitorSharedMutate(static function(array &$state) use ($nodeId): array {
+                $state['subscriptions'][$nodeId] = time() + 15;
+                return is_array($state['nodes'][$nodeId] ?? null) ? $state['nodes'][$nodeId] : [];
+            });
+        } catch (Throwable) {
+            $node = [];
+        }
+        if (is_array($node['detail'] ?? null) && time() - (int)($node['detail_received_at'] ?? 0) <= 12) {
+            echo 'data: ' . json_encode($node['detail'], JSON_UNESCAPED_SLASHES) . "\n\n";
+        } else {
+            echo ": waiting for Agent detail\n\n";
+        }
+        flush();
+        sleep(1);
+    }
+    exit;
+}
 
 if (isset($_GET['stream'])) {
     // Make SSE stream long-lived and reduce server-side timeout disconnects.
@@ -786,13 +1555,184 @@ if (isset($_GET['stream'])) {
     }
     exit;
 }
+
+$monitorRemoteNode = '';
+if ($monitorIsCentral && isset($_GET['node'])) {
+    $requestedNode = (string)$_GET['node'];
+    if (!preg_match('/^[A-Za-z0-9._-]{1,80}$/', $requestedNode)) monitorJsonResponse(['ok' => false, 'error' => 'Invalid node'], 400);
+    $monitorRemoteNode = $requestedNode;
+}
+
+if ($monitorIsCentral && !isset($_GET['local']) && $monitorRemoteNode === '') {
+    $centralUrl = htmlspecialchars((string)($monitorConfig['central_url'] ?? ''), ENT_QUOTES, 'UTF-8');
+    ?>
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Infrastructure Overview - <?php echo htmlspecialchars($hostname, ENT_QUOTES, 'UTF-8'); ?></title>
+    <link href="https://fonts.googleapis.com/css2?family=Roboto:wght@400;500;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css">
+    <style>
+        * { box-sizing: border-box; }
+        body { margin: 0; background: #101214; color: #e8eaed; font-family: Roboto, sans-serif; }
+        .shell { width: min(1480px, calc(100% - 32px)); margin: 0 auto; }
+        .topbar { min-height: 76px; display: flex; align-items: center; justify-content: space-between; gap: 20px; border-bottom: 1px solid #2a2e33; }
+        .brand { display: flex; align-items: center; gap: 13px; min-width: 0; }
+        .brand-mark { width: 38px; height: 38px; display: grid; place-items: center; border: 1px solid #3b434b; background: #1b2025; color: #55c7f3; border-radius: 7px; }
+        h1 { margin: 0; font-size: 21px; line-height: 1.2; letter-spacing: 0; }
+        .subtitle { margin-top: 4px; color: #8d969f; font-size: 12px; }
+        .actions { display: flex; align-items: center; gap: 10px; }
+        .action { color: #dbe2e8; text-decoration: none; border: 1px solid #38414a; background: #191d21; padding: 9px 12px; border-radius: 6px; font-size: 13px; }
+        .summary { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); border-bottom: 1px solid #2a2e33; }
+        .summary-item { padding: 22px 18px; border-right: 1px solid #2a2e33; }
+        .summary-item:first-child { padding-left: 0; }
+        .summary-item:last-child { border-right: 0; }
+        .summary-label { color: #8d969f; text-transform: uppercase; font-size: 10px; letter-spacing: .8px; }
+        .summary-value { margin-top: 7px; font-size: 27px; font-weight: 700; }
+        .summary-note { margin-top: 3px; color: #77818a; font-size: 11px; }
+        .content-head { display: flex; justify-content: space-between; align-items: end; gap: 20px; padding: 26px 0 14px; }
+        .content-head h2 { margin: 0; font-size: 16px; }
+        .stream-state { color: #9aa3ac; font-size: 12px; display: flex; align-items: center; gap: 7px; }
+        .stream-dot, .node-dot { width: 8px; height: 8px; border-radius: 50%; background: #7e8790; }
+        .stream-dot.live, .node-dot.online { background: #46c277; box-shadow: 0 0 8px rgba(70,194,119,.45); }
+        .node-dot.degraded { background: #f1ad45; }
+        .node-dot.offline { background: #ef6262; }
+        .node-groups { padding-bottom: 36px; }
+        .node-section + .node-section { margin-top: 28px; }
+        .group-heading { display: flex; align-items: center; gap: 9px; margin: 0 0 12px; color: #cdd4da; font-size: 13px; font-weight: 700; }
+        .group-count { display: inline-grid; place-items: center; min-width: 22px; height: 20px; padding: 0 6px; border: 1px solid #343c44; border-radius: 10px; color: #7f8a94; font-size: 10px; font-weight: 500; }
+        .node-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(330px, 1fr)); gap: 14px; }
+        .node { display: block; color: inherit; text-decoration: none; background: #181c20; border: 1px solid #2d3339; border-radius: 7px; overflow: hidden; transition: border-color .15s, transform .15s; }
+        .node:hover { border-color: #4b5965; transform: translateY(-1px); }
+        .node-top { display: flex; justify-content: space-between; align-items: flex-start; gap: 15px; padding: 17px 18px 14px; border-bottom: 1px solid #292f35; }
+        .node-name { font-size: 15px; font-weight: 700; overflow-wrap: anywhere; }
+        .node-os { margin-top: 5px; color: #88929b; font-size: 11px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 250px; }
+        .node-status { display: flex; align-items: center; gap: 7px; color: #aab2b9; font-size: 11px; text-transform: uppercase; }
+        .metrics { display: grid; grid-template-columns: 1fr 1fr; }
+        .metric { padding: 14px 18px; border-bottom: 1px solid #292f35; }
+        .metric:nth-child(odd) { border-right: 1px solid #292f35; }
+        .metric-label { color: #89939c; font-size: 10px; text-transform: uppercase; }
+        .metric-value { margin-top: 6px; font-size: 18px; font-weight: 700; }
+        .meter { height: 4px; background: #30363c; margin-top: 8px; overflow: hidden; border-radius: 2px; }
+        .meter span { display: block; height: 100%; background: #52b9e4; }
+        .meter.warn span { background: #f1ad45; }
+        .meter.critical span { background: #ef6262; }
+        .node-foot { display: flex; justify-content: space-between; gap: 10px; padding: 11px 18px; color: #828c95; font-size: 11px; }
+        .empty { grid-column: 1 / -1; padding: 55px 20px; border: 1px dashed #343b42; text-align: center; color: #8c969f; }
+        footer { border-top: 1px solid #2a2e33; color: #69737c; font-size: 11px; padding: 18px 0 25px; }
+        @media (max-width: 720px) {
+            .shell { width: min(100% - 20px, 1480px); }
+            .topbar { align-items: flex-start; padding: 16px 0; }
+            .actions { flex-direction: column; align-items: stretch; }
+            .summary { grid-template-columns: 1fr 1fr; }
+            .summary-item { border-bottom: 1px solid #2a2e33; }
+            .summary-item:nth-child(2) { border-right: 0; }
+            .summary-item:nth-child(3), .summary-item:nth-child(4) { border-bottom: 0; }
+            .summary-item:first-child, .summary-item:nth-child(3) { padding-left: 0; }
+            .node-grid { grid-template-columns: 1fr; }
+        }
+    </style>
+</head>
+<body>
+    <div class="shell">
+        <header class="topbar">
+            <div class="brand">
+                <div class="brand-mark"><i class="fas fa-server"></i></div>
+                <div><h1>Infrastructure Overview</h1><div class="subtitle">Distributed server monitor</div></div>
+            </div>
+            <div class="actions"><a class="action" href="?local=1"><i class="fas fa-chart-line"></i>&nbsp; Local details</a></div>
+        </header>
+        <section class="summary">
+            <div class="summary-item"><div class="summary-label">Registered</div><div class="summary-value" id="sum-total">0</div><div class="summary-note">Monitored nodes</div></div>
+            <div class="summary-item"><div class="summary-label">Online</div><div class="summary-value" id="sum-online">0</div><div class="summary-note">Reporting normally</div></div>
+            <div class="summary-item"><div class="summary-label">Attention</div><div class="summary-value" id="sum-attention">0</div><div class="summary-note">Degraded or offline</div></div>
+            <div class="summary-item"><div class="summary-label">Last update</div><div class="summary-value" id="sum-time" style="font-size:20px">--:--:--</div><div class="summary-note">Central server time</div></div>
+        </section>
+        <div class="content-head">
+            <h2>Servers</h2>
+            <div class="stream-state"><span class="stream-dot" id="stream-dot"></span><span id="stream-label">Connecting</span></div>
+        </div>
+        <main class="node-groups" id="node-groups"><div class="empty">Waiting for the first Agent report...</div></main>
+        <footer>Central endpoint: <?php echo $centralUrl ?: 'Not configured'; ?></footer>
+    </div>
+    <script>
+        const esc = value => String(value ?? '').replace(/[&<>'"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c]));
+        const bytes = value => {
+            const n = Number(value || 0); if (!n) return '0 B';
+            const units = ['B','KB','MB','GB','TB']; const i = Math.min(units.length - 1, Math.floor(Math.log(n) / Math.log(1024)));
+            return (n / 1024 ** i).toFixed(i > 2 ? 1 : 0) + ' ' + units[i];
+        };
+        const percent = value => Math.max(0, Math.min(100, Number(value || 0)));
+        const ageText = age => age < 5 ? 'just now' : age < 60 ? `${age}s ago` : age < 3600 ? `${Math.floor(age / 60)}m ago` : `${Math.floor(age / 3600)}h ago`;
+        const uptimeText = seconds => { const d = Math.floor(seconds / 86400), h = Math.floor(seconds % 86400 / 3600); return d ? `${d}d ${h}h` : `${h}h`; };
+        const meterClass = value => value >= 90 ? 'critical' : value >= 75 ? 'warn' : '';
+        function metric(label, value, pct) {
+            return `<div class="metric"><div class="metric-label">${label}</div><div class="metric-value">${value}</div><div class="meter ${meterClass(pct)}"><span style="width:${percent(pct)}%"></span></div></div>`;
+        }
+        function nodeCard(n) {
+            const m = n.metrics || {}, mem = m.memory || {}, disk = m.disk || {}, net = m.network || {}, gpu = m.gpu || {}, sys = n.system || {};
+            const gpuPct = gpu.available ? percent(gpu.usage) : 0;
+            const gpuValue = gpu.available ? `${Math.round(gpuPct)}%` : 'Not detected';
+            const detailHref = n.is_local ? '?local=1' : `?node=${encodeURIComponent(n.node_id)}`;
+            return `<a class="node" href="${detailHref}">
+                <div class="node-top"><div><div class="node-name">${esc(n.node_id)}</div><div class="node-os">${esc(sys.os || 'System information pending')}</div></div><div class="node-status"><span class="node-dot ${esc(n.status)}"></span>${esc(n.status)}</div></div>
+                <div class="metrics">
+                    ${metric('CPU', `${Math.round(percent(m.cpu?.usage))}%`, m.cpu?.usage)}
+                    ${metric('Memory', `${Math.round(percent(mem.percentage))}%`, mem.percentage)}
+                    ${metric('Disk', `${Math.round(percent(disk.percentage))}%`, disk.percentage)}
+                    ${metric('GPU', gpuValue, gpuPct)}
+                </div>
+                <div class="node-foot"><span>↓ ${bytes(net.rx_speed)}/s · ↑ ${bytes(net.tx_speed)}/s</span><span>Uptime ${uptimeText(m.uptime || 0)} · ${ageText(n.age_seconds || 0)}</span></div>
+            </a>`;
+        }
+        function render(data) {
+            const nodes = Array.isArray(data.nodes) ? data.nodes : [];
+            const online = nodes.filter(n => n.status === 'online').length;
+            document.getElementById('sum-total').textContent = nodes.length;
+            document.getElementById('sum-online').textContent = online;
+            document.getElementById('sum-attention').textContent = nodes.length - online;
+            document.getElementById('sum-time').textContent = new Date((data.server_time || Date.now() / 1000) * 1000).toLocaleTimeString();
+            const container = document.getElementById('node-groups');
+            if (!nodes.length) { container.innerHTML = '<div class="empty">No Agents have registered yet.</div>'; return; }
+            const ungrouped = nodes.filter(n => !String(n.group_name || '').trim());
+            const grouped = new Map();
+            nodes.filter(n => String(n.group_name || '').trim()).forEach(n => {
+                const name = String(n.group_name).trim();
+                if (!grouped.has(name)) grouped.set(name, []);
+                grouped.get(name).push(n);
+            });
+            const sections = [];
+            if (ungrouped.length) sections.push(`<section class="node-section"><div class="node-grid">${ungrouped.map(nodeCard).join('')}</div></section>`);
+            [...grouped.keys()].sort((a, b) => a.localeCompare(b)).forEach(name => {
+                const members = grouped.get(name);
+                sections.push(`<section class="node-section"><h3 class="group-heading">${esc(name)}<span class="group-count">${members.length}</span></h3><div class="node-grid">${members.map(nodeCard).join('')}</div></section>`);
+            });
+            container.innerHTML = sections.join('');
+        }
+        const dot = document.getElementById('stream-dot'), label = document.getElementById('stream-label');
+        const source = new EventSource('?monitor_api=overview_stream');
+        source.onopen = () => { dot.classList.add('live'); label.textContent = 'Live'; };
+        source.onmessage = event => { try { render(JSON.parse(event.data)); } catch (_) {} };
+        source.onerror = () => { dot.classList.remove('live'); label.textContent = 'Reconnecting'; };
+    </script>
+</body>
+</html>
+    <?php
+    exit;
+}
+$monitorAgentStatus = monitorSharedRead()['agent_status'];
+$monitorConfigMessage = $_SESSION['monitor_config_message'] ?? null;
+unset($_SESSION['monitor_config_message']);
+$monitorPageHost = $monitorRemoteNode !== '' ? $monitorRemoteNode : $hostname;
 ?>
 <!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Server Resource Monitor<?php echo $hostname ? ' - ' . htmlspecialchars($hostname, ENT_QUOTES, 'UTF-8') : ''; ?></title>
+    <title>Server Resource Monitor<?php echo $monitorPageHost ? ' - ' . htmlspecialchars($monitorPageHost, ENT_QUOTES, 'UTF-8') : ''; ?></title>
     <link href="https://fonts.googleapis.com/css2?family=Roboto:wght@300;400;500;700&display=swap" rel="stylesheet">
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css">
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
@@ -823,6 +1763,9 @@ if (isset($_GET['stream'])) {
             border-radius: 20px;
             border: 1px solid #333;
         }
+        .header-actions { display: flex; align-items: center; gap: 10px; }
+        .overview-button { display: inline-flex; align-items: center; gap: 7px; height: 30px; padding: 0 11px; color: #dce3e8; text-decoration: none; background: #252525; border: 1px solid #3a424a; border-radius: 6px; font-size: 12px; }
+        .overview-button:hover { border-color: #4fc3f7; color: #4fc3f7; }
         .dashboard-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 20px; margin-bottom: 20px; }
         .card { background: #1e1e1e; border-radius: 8px; padding: 20px; box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1); border: 1px solid #333; display: flex; flex-direction: column; }
         .card-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px; height: 28px; }
@@ -888,7 +1831,11 @@ if (isset($_GET['stream'])) {
         .status-critical { background: #f44336; box-shadow: 0 0 5px #f44336; }
         .toggle-btn, #network-interface-select { background: #333; color: #e0e0e0; border: 1px solid #555; border-radius: 4px; padding: 0 8px; cursor: pointer; font-size: 12px; height: 24px; line-height: 22px; box-sizing: border-box; vertical-align: middle; }
         .toggle-btn.active { background: #4fc3f7; color: #000; }
-        .cpu-percore-container { margin-top: 10px; display: grid; grid-template-columns: repeat(auto-fill, minmax(80px, 1fr)); gap: 8px; max-height: 200px; overflow-y: auto; }
+        .cpu-percore-container { margin-top: 10px; display: grid; grid-template-columns: repeat(auto-fill, minmax(80px, 1fr)); gap: 8px; max-height: 200px; overflow-y: auto; scrollbar-width: thin; scrollbar-color: #4a4a4a #1f1f1f; }
+        .cpu-percore-container::-webkit-scrollbar { width: 10px; }
+        .cpu-percore-container::-webkit-scrollbar-track { background: #1f1f1f; border-radius: 8px; }
+        .cpu-percore-container::-webkit-scrollbar-thumb { background: #4a4a4a; border-radius: 8px; border: 2px solid #1f1f1f; }
+        .cpu-percore-container::-webkit-scrollbar-thumb:hover { background: #5a5a5a; }
         .core-chart-container { height: 60px; position: relative; border: 1px solid #333; border-radius: 4px; }
         .core-chart-label { position: absolute; top: 1px; left: 3px; font-size: 9px; color: #bbb; z-index: 10; font-weight: 500; }
         .network-stats-row { display: flex; justify-content: space-between; margin-bottom: 5px; font-size: 14px; }
@@ -896,6 +1843,19 @@ if (isset($_GET['stream'])) {
         #disk-select { background: #333; color: #e0e0e0; border: 1px solid #555; border-radius: 4px; padding: 4px 8px; font-size: 12px; }
         #connection-status { padding: 5px 10px; border-radius: 4px; font-size: 12px; margin-bottom: 10px; display: none; text-align: center; }
         .error { background: #f44336; color: white; }
+        .central-settings { margin-top: 20px; }
+        .agent-state { display: flex; align-items: center; gap: 7px; color: #9da5ad; font-size: 11px; }
+        .agent-state-dot { width: 8px; height: 8px; border-radius: 50%; background: #ef6262; }
+        .agent-state-dot.connected { background: #46c277; box-shadow: 0 0 7px rgba(70,194,119,.45); }
+        .central-form { display: grid; grid-template-columns: minmax(220px, 2fr) minmax(150px, 1fr) minmax(140px, 1fr) 80px auto; gap: 10px; align-items: end; }
+        .form-field { min-width: 0; }
+        .form-field label { display: block; margin-bottom: 5px; color: #89939c; font-size: 10px; text-transform: uppercase; letter-spacing: .5px; }
+        .form-field input { width: 100%; height: 36px; padding: 0 10px; border: 1px solid #3a424a; border-radius: 5px; background: #20252a; color: #edf0f2; outline: none; }
+        .form-field input:focus { border-color: #4fc3f7; }
+        .save-central { height: 36px; padding: 0 15px; border: 0; border-radius: 5px; background: #4fc3f7; color: #071116; font-weight: 700; cursor: pointer; }
+        .config-message { margin-bottom: 12px; padding: 9px 11px; border-radius: 5px; font-size: 12px; border: 1px solid; }
+        .config-message.success { color: #7edba2; background: rgba(70,194,119,.08); border-color: rgba(70,194,119,.3); }
+        .config-message.error { color: #ff8f8f; background: rgba(239,98,98,.08); border-color: rgba(239,98,98,.3); }
         
         /* Enhanced System Info */
         .info-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 20px; }
@@ -912,8 +1872,12 @@ if (isset($_GET['stream'])) {
 
         /* Mobile Responsive - Bottom cards match top cards behavior */
         @media (max-width: 650px) {
+            header { align-items: flex-start; gap: 12px; }
+            h1 { font-size: 20px; line-height: 1.25; }
+            .header-actions { flex-direction: column; align-items: flex-end; flex-shrink: 0; }
             .grid-2col { display: flex; flex-direction: column; }
             .info-grid { grid-template-columns: 1fr; }
+            .central-form { grid-template-columns: 1fr; }
         }
         footer { margin-top: 40px; padding: 20px 0; border-top: 1px solid #333; text-align: center; color: #777; font-size: 14px; }
         footer a { color: #4fc3f7; text-decoration: none; }
@@ -925,8 +1889,11 @@ if (isset($_GET['stream'])) {
     <div class="container">
         <div id="connection-status"></div>
         <header>
-            <h1 id="page-title"><i class="fas fa-chart-line"></i> Server Resource Monitor<?php echo $hostname ? ' - ' . htmlspecialchars($hostname, ENT_QUOTES, 'UTF-8') : ''; ?></h1>
-            <div class="timestamp" id="current-time">Connecting...</div>
+            <h1 id="page-title"><i class="fas fa-chart-line"></i> Server Resource Monitor<?php echo $monitorPageHost ? ' - ' . htmlspecialchars($monitorPageHost, ENT_QUOTES, 'UTF-8') : ''; ?></h1>
+            <div class="header-actions">
+                <?php if ($monitorIsCentral): ?><a class="overview-button" href="./"><i class="fas fa-arrow-left"></i> Return to overview</a><?php endif; ?>
+                <div class="timestamp" id="current-time">Connecting...</div>
+            </div>
         </header>
 
         <div class="dashboard-grid">
@@ -1060,6 +2027,39 @@ if (isset($_GET['stream'])) {
                 </div>
             </div>
         </div>
+
+        <?php
+            $configuredCentralHost = strtolower((string)(parse_url((string)($monitorConfig['central_url'] ?? ''), PHP_URL_HOST) ?: ''));
+            $currentRequestHost = strtolower(preg_replace('/:\d+$/', '', (string)($_SERVER['HTTP_HOST'] ?? $_SERVER['SERVER_NAME'] ?? '')));
+            $centralTargetsSelf = $configuredCentralHost !== ''
+                && ($configuredCentralHost === $currentRequestHost || in_array($configuredCentralHost, ['127.0.0.1', 'localhost', '::1'], true));
+            $agentStatusAge = time() - (int)($monitorAgentStatus['updated_at'] ?? 0);
+            $agentStatusCurrent = $agentStatusAge >= 0 && $agentStatusAge <= 60;
+            $agentFresh = $centralTargetsSelf || ($agentStatusCurrent && !empty($monitorAgentStatus['ok']));
+            if ($centralTargetsSelf) {
+                $agentMessage = 'This server';
+            } elseif (!$agentStatusCurrent) {
+                $agentMessage = empty($monitorConfig['central_url']) ? 'Not configured' : 'Waiting for Agent service';
+            } else {
+                $agentMessage = $monitorAgentStatus['message'] ?? 'Waiting for Agent service';
+            }
+        ?>
+        <section class="card central-settings">
+            <div class="card-header">
+                <div class="card-title"><i class="fas fa-satellite-dish" style="margin-right:8px"></i>Central connection</div>
+                <div class="agent-state"><span class="agent-state-dot<?php echo $agentFresh ? ' connected' : ''; ?>"></span><?php echo htmlspecialchars((string)$agentMessage, ENT_QUOTES, 'UTF-8'); ?></div>
+            </div>
+            <?php if (is_array($monitorConfigMessage)): ?><div class="config-message <?php echo $monitorConfigMessage['type'] === 'success' ? 'success' : 'error'; ?>"><?php echo htmlspecialchars((string)$monitorConfigMessage['text'], ENT_QUOTES, 'UTF-8'); ?></div><?php endif; ?>
+            <form class="central-form" method="post">
+                <input type="hidden" name="csrf" value="<?php echo htmlspecialchars((string)$_SESSION['monitor_csrf'], ENT_QUOTES, 'UTF-8'); ?>">
+                <input type="hidden" name="monitor_save_config" value="1">
+                <div class="form-field"><label for="central-url">Central server</label><input id="central-url" name="central_url" value="<?php echo htmlspecialchars((string)$monitorConfig['central_url'], ENT_QUOTES, 'UTF-8'); ?>" placeholder="https://monitor.example.com"></div>
+                <div class="form-field"><label for="node-id">Node name</label><input id="node-id" name="node_id" value="<?php echo htmlspecialchars((string)$monitorConfig['node_id'], ENT_QUOTES, 'UTF-8'); ?>" required></div>
+                <div class="form-field"><label for="group-name">Group name</label><input id="group-name" name="group_name" maxlength="80" value="<?php echo htmlspecialchars((string)$monitorConfig['group_name'], ENT_QUOTES, 'UTF-8'); ?>" placeholder="Optional"></div>
+                <div class="form-field"><label for="sample-interval">Seconds</label><input id="sample-interval" type="number" name="sample_interval" min="2" max="30" value="<?php echo (int)$monitorConfig['sample_interval']; ?>"></div>
+                <button class="save-central" type="submit">Save</button>
+            </form>
+        </section>
     </div>
 
     <footer>
@@ -1445,10 +2445,18 @@ if (isset($_GET['stream'])) {
         });
 
         const statusEl = document.getElementById('connection-status');
-        const evtSource = new EventSource("?stream=1");
+        const remoteNode = <?php echo json_encode($monitorRemoteNode, JSON_UNESCAPED_SLASHES); ?>;
+        const streamUrl = remoteNode ? ('?monitor_api=remote_stream&node=' + encodeURIComponent(remoteNode)) : '?stream=1';
+        const evtSource = new EventSource(streamUrl);
+
+        if (remoteNode) {
+            statusEl.style.display = 'block';
+            statusEl.style.background = '#1d4050';
+            statusEl.textContent = 'Requesting live detail from ' + remoteNode + '...';
+        }
 
         evtSource.onopen = () => {
-            statusEl.style.display = 'none';
+            if (!remoteNode) statusEl.style.display = 'none';
         };
 
         const updateStatus = (id, percentage) => {

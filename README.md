@@ -1,104 +1,195 @@
 # PHP Server Dashboard
 
-A lightweight, single-file PHP application for real-time Linux server monitoring. This tool provides a comprehensive dashboard to visualize system performance directly in your browser without the need for complex agents or external dependencies.
+PHP Server Dashboard is a lightweight, single-file Linux resource monitor. The same `index.php` can run as a standalone dashboard, a central overview, or a reporting node. It does not require a database, Docker, Redis, or a separate application runtime.
 
-## 🚀 Features
+## Current capabilities
 
-- **Real-time Monitoring**: Powered by Server-Sent Events (SSE) for low-latency updates.
-- **CPU Insights**: Total usage, per-core load, temperature, and model info.
-- **Memory & Swap**: Detailed visualization of RAM and Swap usage.
-- **Storage**: Disk space capacity and real-time Disk I/O (Read/Write speeds).
-- **Networking**: Bandwidth monitoring (Upload/Download) and interface IP details.
-- **GPU Support**: Auto-detects Intel and NVIDIA GPUs (requires `intel_gpu_top`, `xpu-smi`, or `nvidia-smi`).
-- **Process Management**: View top 10 processes sorted by CPU usage.
-- **System Info**: OS distribution, kernel version, uptime, and load averages.
-- **Modern UI**: Dark-themed, responsive dashboard built with Chart.js and Font Awesome.
+- Live CPU usage, per-core load, temperatures, model information, and load averages
+- RAM, swap, disk capacity, and disk I/O monitoring
+- Network throughput, totals, interfaces, and local addresses
+- Top processes with continuously sampled CPU and memory usage
+- NVIDIA, Intel, and compatible GPU detection where vendor tools are available
+- Operating system, kernel, architecture, uptime, and hardware details
+- Server-Sent Events for live browser updates
+- Central overview for multiple Linux servers
+- Optional node groups in the central overview
+- On-demand detailed telemetry so remote nodes normally send only lightweight summaries
+- Automatic removal of nodes that stop reporting for three minutes
+- Systemd and OpenRC Agent installation from the same PHP file
+- Embedded per-machine settings; no companion configuration file is required
 
-## 📋 Requirements
+## How distributed monitoring works
 
-- **OS**: Linux (Targeted for `/proc` filesystem and standard CLI tools).
-- **Web Server**: Apache, Nginx, or any PHP-capable server.
-- **PHP**: 7.4 or higher.
-- **Permissions**: The PHP user needs read access to `/proc` and `/sys`, and permission to execute basic commands like `ps`, `df`, and `ip`.
+Every machine receives a copy of `index.php`.
 
-## ⚙️ Installation
+- The **central server** receives signed summary reports and displays all active nodes. It samples its own resources inside the web process and should not run an Agent that reports back to itself.
+- A **reporting node** runs the same file as a small background Agent. It sends summary metrics at the configured interval.
+- When an authenticated user opens a remote node, the central server temporarily asks that Agent for detailed process, hardware, disk, and interface data.
+- Node state, browser sessions, and detail leases are held in SysV shared memory. They are intentionally ephemeral and are rebuilt after a reboot.
 
-1. Upload `index.php` to your web server's public directory.
-2. Access the file via your browser (e.g., `http://your-server-ip/index.php`).
+## Requirements
 
-## 🔒 Password Protection
+- Linux with `/proc` and `/sys`
+- Nginx, Apache, or another PHP-capable web server
+- PHP 8.1 or newer
+- PHP extensions: `sysvshm`, `sysvsem`, and preferably `curl`
+- Standard tools such as `ps`, `df`, `ip`, `lscpu`, and `getconf`
+- Optional hardware tools: `lshw`, `nvidia-smi`, `intel_gpu_top`, or `xpu-smi`
 
-The dashboard is protected by a simple password layer to prevent unauthorized access.
+The service installer also uses the PHP POSIX extension when available.
 
-### How to Change the Password
+## Security setup
 
-1. Open `index.php` in a text editor.
-2. Locate the following line near the top of the file:
-   ```php
-   $PROTECTED_PASSWORD = "admin888"; // CHANGE THIS PASSWORD
-   ```
-3. Replace `"admin888"` with your desired secure password.
-4. Save the file.
+The public repository deliberately contains no usable credentials. Before deployment, replace these two placeholders near the top of `index.php`:
 
-## 🛠️ Troubleshooting
+```php
+$PROTECTED_PASSWORD = 'CHANGE_THIS_DASHBOARD_PASSWORD';
+$MONITOR_CONNECTION_KEY = 'CHANGE_THIS_MONITOR_CONNECTION_KEY';
+```
 
-- **No Data?**: Ensure your server is running Linux. This script relies heavily on the `/proc` filesystem.
-- **SSE Connection Lost**: Check if your web server (like Nginx) has buffering enabled. The script attempts to disable it with `X-Accel-Buffering: no`, but some configurations might require manual adjustment.
-- **GPU Stats Missing**: Ensure the necessary drivers and monitoring tools (`nvidia-smi`, `intel_gpu_top`, etc.) are installed and accessible by the PHP user.
+Use independent, randomly generated values. The dashboard refuses browser access, Agent startup, and report ingestion while either placeholder remains unchanged.
 
-### Recommended Nginx + PHP-FPM Settings (for stable SSE)
+The current distributed protocol uses one connection key for every node attached to the same central dashboard. Keep customized copies out of Git and treat the deployed PHP file as a secret-bearing configuration file.
 
-Use these settings to reduce random SSE disconnects and avoid frequent re-login caused by dropped long connections.
+Recommended protections:
 
-#### Nginx (location for `index.php`)
+- Serve the dashboard only over HTTPS.
+- Prefer Tailscale, Cloudflare Access, a VPN, or an IP allowlist for the browser interface.
+- Make `index.php` readable only by root and the PHP/Agent group.
+- Do not commit a configured production copy back to this repository.
+- Use the CLI configuration workflow so the web process does not need write access to its own source file.
+
+## Install a central server
+
+Install the file into the web root. Adjust the PHP group and destination for your distribution:
+
+```bash
+sudo install -o root -g www-data -m 0640 index.php /var/www/html/index.php
+sudo php /var/www/html/index.php --configure \
+  --central-url=https://monitor.example.com \
+  --node-id=au-mel-monitor \
+  --group-name=Infrastructure \
+  --sample-interval=3
+```
+
+Do not install the Agent service on the central server when its central URL points to itself. The overview appears automatically after the first remote node reports, and the central machine is included in that overview.
+
+## Install a reporting node
+
+Use the same monitor connection key as the central server, then configure and install the Agent:
+
+```bash
+sudo install -o root -g www-data -m 0640 index.php /var/www/html/index.php
+
+sudo php /var/www/html/index.php --configure \
+  --central-url=https://monitor.example.com \
+  --node-id=ae-dxb-app-01 \
+  --group-name=Production \
+  --sample-interval=3
+
+sudo php /var/www/html/index.php --install-agent
+```
+
+The installer detects systemd or OpenRC, creates `linxi-monitor-agent`, enables it at boot, and starts it immediately.
+
+The central URL may point to a site root or directly to a PHP path:
+
+```text
+https://monitor.example.com
+https://monitor.example.com/index.php
+http://192.168.1.20/monitor.php
+```
+
+An empty node ID uses the machine hostname. The sample interval is restricted to 2-30 seconds.
+
+## CLI reference
+
+```bash
+# Update embedded node settings
+sudo php index.php --configure \
+  --central-url=https://monitor.example.com \
+  --node-id=my-node \
+  --group-name=MyGroup \
+  --sample-interval=3
+
+# Install or update the background Agent
+sudo php index.php --install-agent
+
+# Run the Agent in the foreground for diagnosis
+sudo -u www-data php index.php --agent
+```
+
+Configuration is embedded into the `MONITOR_EMBEDDED_SETTINGS` block inside the PHP file. Running `--configure` safely replaces only that block.
+
+## Recommended Nginx configuration
 
 ```nginx
+root /var/www/html;
+index index.php;
+
+location / {
+    try_files $uri /index.php?$query_string;
+}
+
 location = /index.php {
     include fastcgi_params;
-    fastcgi_param SCRIPT_FILENAME $document_root/index.php;
-    fastcgi_pass unix:/run/php/php8.5-fpm.sock;
+    fastcgi_param SCRIPT_FILENAME /var/www/html/index.php;
+    fastcgi_param SCRIPT_NAME /index.php;
+    fastcgi_param PHP_SELF /index.php;
+    fastcgi_param HTTPS $https;
+    fastcgi_pass unix:/run/php/php8.3-fpm.sock;
 
-    # SSE stability
     fastcgi_buffering off;
-    fastcgi_request_buffering off;
-    gzip off;
+    fastcgi_read_timeout 3600s;
+}
 
-    # Long-lived stream
-    fastcgi_read_timeout 1h;
-    fastcgi_send_timeout 1h;
-    send_timeout 1h;
+location ~ \.php$ {
+    return 404;
 }
 ```
 
-#### Nginx (global / server level)
+Replace the PHP-FPM socket with the version installed on the server. Disabling FastCGI buffering is important for Server-Sent Events.
 
-```nginx
-proxy_read_timeout 1h;
-proxy_send_timeout 1h;
-keepalive_timeout 75s;
-```
+## File ownership and browser configuration
 
-#### PHP-FPM (`php.ini` / pool settings)
+The recommended `root:www-data 0640` ownership lets PHP-FPM and the Agent read the file but prevents web requests from rewriting it. With these permissions, update embedded settings through `sudo php index.php --configure`.
 
-```ini
-max_execution_time = 0
-output_buffering = Off
-zlib.output_compression = Off
-session.gc_maxlifetime = 43200
-```
+The dashboard also contains a browser settings form for installations that intentionally make the file writable by the PHP user. CLI configuration is safer for Internet-reachable deployments.
 
-```ini
-; in php-fpm pool (www.conf)
-request_terminate_timeout = 0
-```
+## Data lifecycle
 
-After updating configs, reload services:
+The project intentionally has no persistent database:
+
+- Reporting nodes disappear from the overview after three minutes without a report.
+- Shared node state and login sessions are cleared by a reboot or removal of the SysV shared-memory segment.
+- The Agent automatically reconnects and repopulates the central overview.
+- Historical charts exist only in the current browser session.
+
+This design keeps the monitor small and disposable, but it is not intended for long-term metrics retention or audit logging.
+
+## Troubleshooting
+
+### The central overview does not appear
+
+The page becomes a central overview after it receives a report from another node. Check the Agent service and ensure the connection key matches.
 
 ```bash
-sudo systemctl reload nginx
-sudo systemctl reload php8.5-fpm
+sudo systemctl status linxi-monitor-agent
+sudo journalctl -u linxi-monitor-agent -n 100 --no-pager
 ```
 
-## 📄 License
+### Live data disconnects
 
-This project is open-source. Feel free to modify and distribute as needed.
+Confirm that FastCGI buffering is disabled and the read timeout is long enough. Also verify that PHP-FPM has enough workers for the number of simultaneously open dashboards.
+
+### GPU information is unavailable
+
+Install the appropriate vendor utility and make sure the PHP/Agent user can execute it. GPU monitoring is optional and does not affect CPU, memory, disk, or network telemetry.
+
+### Embedded settings cannot be saved
+
+Use the CLI command with `sudo`. A root-owned production file is intentionally not writable by PHP-FPM.
+
+## External browser assets
+
+The current interface loads fonts, icons, and Chart.js from public CDNs. Servers used on isolated networks must either allow those requests or replace the external assets with locally hosted equivalents.
